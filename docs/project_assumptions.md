@@ -31,14 +31,15 @@ STM32G071GBU6, rdzen Cortex-M0+, taktowanie startowe 64 MHz z HSI + PLL.
 - Dolna faza aktywna jest zapinana do GND.
 - Faza niepracujaca ma gorna i dolna galaz w stanie off, zeby mozna bylo mierzyc BEMF.
 
-## Etap 10 - pierwszy rozruch SINUS
+## Etap 10 - pierwszy rozruch SINUS open-loop
 
 - Sterownik po `MOTOR_Init()` startuje w trybie `MOTOR_MODE_SINUS`.
-- Predkosc rozruchowa jest stala w programie: `DRIVER_STARTUP_SINUS_TARGET_RPM`.
-- Maksymalne wypelnienie PWM jest stale w programie: `DRIVER_STARTUP_SINUS_MAX_DUTY_PERMILLE`.
+- Predkosc rozruchowa jest stala w programie: `DRIVER_OPEN_LOOP_SINUS_RPM`.
+- Maksymalne wypelnienie PWM jest stale w programie: `DRIVER_OPEN_LOOP_MAX_DUTY_PERMILLE`.
 - Kierunek jest na razie staly: `MOTOR_DIRECTION_CW`.
 - TIM6 daje tick 10 kHz, a pozycja elektryczna jest prowadzona akumulatorem Q16.
 - Trzy probki tabeli sinus sa przesuniete o ok. 120/240 stopni elektrycznych. Najnizsza faza jest klamrowana dolna galezia do GND, pozostale fazy dostaja PWM wysokiej galezi ograniczony stalym limitem.
+- W tym etapie nie ma przejscia do 6-step, BEMF nie steruje komutacja, PID pradu jest odlozony na kolejny krok.
 
 ## NVM
 

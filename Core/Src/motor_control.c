@@ -1,14 +1,10 @@
 #include "motor_control.h"
 
-#include "bemf_am32.h"
 #include "board.h"
 #include "nvm_config.h"
 #include "sinus_table.h"
 
 motor_control_state_t g_motor;
-
-static volatile uint16_t s_bemf_interval_counter;
-static volatile uint16_t s_bemf_average_interval = 1000u;
 
 static uint32_t MOTOR_GetAbsRpm(int32_t rpm)
 {
@@ -20,19 +16,19 @@ static uint32_t MOTOR_GetAbsRpm(int32_t rpm)
     return (uint32_t)rpm;
 }
 
+static uint16_t MOTOR_GetPolePairs(void)
+{
+    if (g_driver_config.pole_pairs > 0u)
+    {
+        return g_driver_config.pole_pairs;
+    }
+
+    return 1u;
+}
+
 static uint16_t MOTOR_GetSinusSample(uint16_t index)
 {
     return g_sinus_table[index % DRIVER_SIN_TABLE_STEPS];
-}
-
-static int32_t MOTOR_GetMeasuredRpm(void)
-{
-    if (g_driver_config.pole_pairs == 0u)
-    {
-        return 0;
-    }
-
-    return g_motor.measured_erpm / (int32_t)g_driver_config.pole_pairs;
 }
 
 static uint16_t MOTOR_GetMin3(uint16_t a, uint16_t b, uint16_t c)
@@ -62,7 +58,7 @@ static uint16_t MOTOR_ScaleSinusDuty(uint16_t sample, uint16_t min_sample)
 
 static void MOTOR_UpdateSinusPwmLimit(void)
 {
-    uint32_t duty_permille = DRIVER_STARTUP_SINUS_MAX_DUTY_PERMILLE;
+    uint32_t duty_permille = DRIVER_OPEN_LOOP_MAX_DUTY_PERMILLE;
 
     if (duty_permille > 1000u)
     {
@@ -75,8 +71,8 @@ static void MOTOR_UpdateSinusPwmLimit(void)
 
 static void MOTOR_UpdateSinusTiming(void)
 {
-    const uint32_t rpm = MOTOR_GetAbsRpm(g_motor.ramped_target_rpm);
-    const uint64_t numerator = (uint64_t)rpm * g_driver_config.pole_pairs *
+    const uint32_t rpm = MOTOR_GetAbsRpm(DRIVER_OPEN_LOOP_SINUS_RPM);
+    const uint64_t numerator = (uint64_t)rpm * MOTOR_GetPolePairs() *
                                DRIVER_SIN_TABLE_STEPS * 65536u;
     const uint32_t denominator = 60u * DRIVER_CONTROL_LOOP_HZ;
 
@@ -129,8 +125,8 @@ void MOTOR_Init(void)
 {
     g_motor.mode = MOTOR_MODE_SINUS;
     g_motor.direction = MOTOR_DIRECTION_CW;
-    g_motor.target_rpm = DRIVER_STARTUP_SINUS_TARGET_RPM;
-    g_motor.ramped_target_rpm = DRIVER_STARTUP_SINUS_TARGET_RPM;
+    g_motor.target_rpm = DRIVER_OPEN_LOOP_SINUS_RPM;
+    g_motor.ramped_target_rpm = DRIVER_OPEN_LOOP_SINUS_RPM;
     g_motor.measured_erpm = 0;
     g_motor.sinus_angle_q16 = 0u;
     g_motor.sinus_step_q16 = 0u;
@@ -140,7 +136,6 @@ void MOTOR_Init(void)
     g_motor.bemf_readable = 0u;
     g_motor.sixstep_step = 1u;
 
-    BEMF_AM32_Init(&s_bemf_interval_counter, &s_bemf_average_interval, MOTOR_BemfZeroCrossIrq);
     MOTOR_UpdateSinusPwmLimit();
     MOTOR_UpdateSinusTiming();
     MOTOR_ApplySinusBridge();
@@ -148,49 +143,24 @@ void MOTOR_Init(void)
 
 void MOTOR_SetTargetRpm(int32_t rpm, motor_direction_t direction)
 {
-    g_motor.target_rpm = rpm;
-    g_motor.ramped_target_rpm = rpm;
-    g_motor.direction = direction;
+    (void)rpm;
+    (void)direction;
+
+    g_motor.target_rpm = DRIVER_OPEN_LOOP_SINUS_RPM;
+    g_motor.ramped_target_rpm = DRIVER_OPEN_LOOP_SINUS_RPM;
+    g_motor.direction = MOTOR_DIRECTION_CW;
     MOTOR_UpdateSinusTiming();
 }
 
 void MOTOR_ControlTick10kHz(void)
 {
-    const int32_t measured_rpm = MOTOR_GetMeasuredRpm();
-    const int32_t error = g_motor.target_rpm - measured_rpm;
-
-    s_bemf_interval_counter++;
-
-    if (error < 0)
-    {
-        g_motor.in_rpm = ((uint32_t)(-error) <= g_driver_config.in_rpm_window);
-    }
-    else
-    {
-        g_motor.in_rpm = ((uint32_t)error <= g_driver_config.in_rpm_window);
-    }
-
     if (g_motor.mode == MOTOR_MODE_SINUS)
     {
         MOTOR_SinusStepIrq();
-
-        if (((uint32_t)MOTOR_GetAbsRpm(measured_rpm) >= g_driver_config.sin_to_sixstep_rpm) &&
-            (g_motor.bemf_readable != 0u))
-        {
-            g_motor.mode = MOTOR_MODE_SIXSTEP;
-        }
+        return;
     }
 
-    if (g_motor.mode == MOTOR_MODE_SIXSTEP)
-    {
-        const uint32_t return_rpm = g_driver_config.sin_to_sixstep_rpm -
-                                    g_driver_config.sixstep_to_sin_hysteresis_rpm;
-
-        if ((uint32_t)MOTOR_GetAbsRpm(measured_rpm) < return_rpm)
-        {
-            g_motor.mode = MOTOR_MODE_SINUS;
-        }
-    }
+    BOARD_AllPhasesOff();
 }
 
 void MOTOR_SinusStepIrq(void)
@@ -202,7 +172,7 @@ void MOTOR_SinusStepIrq(void)
         return;
     }
 
-    if (g_motor.ramped_target_rpm == 0)
+    if (DRIVER_OPEN_LOOP_SINUS_RPM == 0)
     {
         BOARD_AllPhasesOff();
         return;
@@ -217,7 +187,8 @@ void MOTOR_SinusStepIrq(void)
 
     g_motor.sinus_table_index = (uint16_t)(g_motor.sinus_angle_q16 >> 16u);
     MOTOR_ApplySinusBridge();
-    g_motor.measured_erpm = g_motor.ramped_target_rpm * (int32_t)g_driver_config.pole_pairs;
+    g_motor.measured_erpm = DRIVER_OPEN_LOOP_SINUS_RPM * (int32_t)MOTOR_GetPolePairs();
+    g_motor.in_rpm = 1u;
 }
 
 void MOTOR_BemfZeroCrossIrq(void)
