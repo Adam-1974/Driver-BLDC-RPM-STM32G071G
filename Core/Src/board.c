@@ -2,15 +2,51 @@
 
 #include "app_config.h"
 
-#define BOARD_PWM_PERIOD_TICKS          ((DRIVER_SYSCLK_HZ / DRIVER_PWM_CARRIER_HZ) - 1u)
-#define BOARD_CONTROL_TIMER_PRESCALER   ((DRIVER_SYSCLK_HZ / 1000000u) - 1u)
-#define BOARD_CONTROL_TIMER_PERIOD      ((1000000u / DRIVER_CONTROL_LOOP_HZ) - 1u)
+#define BOARD_COUNTER_CLOCK_HZ          1000000u
+
+static uint16_t s_pwm_period_ticks;
+
+static uint32_t BOARD_GetTimerClockHz(void)
+{
+    uint32_t timer_clock_hz = HAL_RCC_GetPCLK1Freq();
+
+    if ((RCC->CFGR & RCC_CFGR_PPRE) != RCC_HCLK_DIV1)
+    {
+        timer_clock_hz *= 2u;
+    }
+
+    return timer_clock_hz;
+}
+
+static uint16_t BOARD_CalcPeriodTicks(uint32_t timer_clock_hz, uint32_t target_hz)
+{
+    uint32_t period_ticks;
+
+    if ((timer_clock_hz == 0u) || (target_hz == 0u))
+    {
+        return 0u;
+    }
+
+    period_ticks = (timer_clock_hz + (target_hz / 2u)) / target_hz;
+
+    if (period_ticks == 0u)
+    {
+        period_ticks = 1u;
+    }
+
+    if (period_ticks > 65536u)
+    {
+        period_ticks = 65536u;
+    }
+
+    return (uint16_t)(period_ticks - 1u);
+}
 
 static uint16_t BOARD_LimitPwmTicks(uint16_t ticks)
 {
-    if (ticks > BOARD_PWM_PERIOD_TICKS)
+    if (ticks > s_pwm_period_ticks)
     {
-        return BOARD_PWM_PERIOD_TICKS;
+        return s_pwm_period_ticks;
     }
 
     return ticks;
@@ -56,6 +92,9 @@ void BOARD_InitStaticOutputs(void)
 void BOARD_InitPwmOutputs(void)
 {
     GPIO_InitTypeDef gpio = { 0 };
+    const uint32_t timer_clock_hz = BOARD_GetTimerClockHz();
+
+    s_pwm_period_ticks = BOARD_CalcPeriodTicks(timer_clock_hz, DRIVER_PWM_CARRIER_HZ);
 
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_TIM1_CLK_ENABLE();
@@ -72,7 +111,7 @@ void BOARD_InitPwmOutputs(void)
     TIM1->SMCR = 0u;
     TIM1->DIER = 0u;
     TIM1->PSC = 0u;
-    TIM1->ARR = BOARD_PWM_PERIOD_TICKS;
+    TIM1->ARR = s_pwm_period_ticks;
     TIM1->CCR1 = 0u;
     TIM1->CCR2 = 0u;
     TIM1->CCR3 = 0u;
@@ -89,11 +128,16 @@ void BOARD_InitPwmOutputs(void)
 
 void BOARD_InitControlTick(void)
 {
+    const uint32_t timer_clock_hz = BOARD_GetTimerClockHz();
+    const uint16_t prescaler = BOARD_CalcPeriodTicks(timer_clock_hz, BOARD_COUNTER_CLOCK_HZ);
+    const uint32_t counter_clock_hz = timer_clock_hz / ((uint32_t)prescaler + 1u);
+    const uint16_t period = BOARD_CalcPeriodTicks(counter_clock_hz, DRIVER_CONTROL_LOOP_HZ);
+
     __HAL_RCC_TIM6_CLK_ENABLE();
 
     TIM6->CR1 = 0u;
-    TIM6->PSC = BOARD_CONTROL_TIMER_PRESCALER;
-    TIM6->ARR = BOARD_CONTROL_TIMER_PERIOD;
+    TIM6->PSC = prescaler;
+    TIM6->ARR = period;
     TIM6->CNT = 0u;
     TIM6->SR = 0u;
     TIM6->DIER = TIM_DIER_UIE;
@@ -118,7 +162,7 @@ void BOARD_AllPhasesOff(void)
 
 uint16_t BOARD_GetPwmPeriodTicks(void)
 {
-    return BOARD_PWM_PERIOD_TICKS;
+    return s_pwm_period_ticks;
 }
 
 void BOARD_SetHighPwm(uint16_t phase_a_ticks, uint16_t phase_b_ticks, uint16_t phase_c_ticks)

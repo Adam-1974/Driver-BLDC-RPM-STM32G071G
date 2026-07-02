@@ -1,5 +1,6 @@
 #include "main.h"
 
+#include "app_config.h"
 #include "board.h"
 #include "motor_control.h"
 #include "nvm_config.h"
@@ -48,10 +49,29 @@ void SystemClock_Config(void)
     }
 }
 
+static void MAIN_CheckClockTree(void)
+{
+    if (HAL_RCC_GetSysClockFreq() != DRIVER_EXPECTED_SYSCLK_HZ)
+    {
+        MAIN_ErrorHandler();
+    }
+
+    if (HAL_RCC_GetHCLKFreq() != DRIVER_EXPECTED_SYSCLK_HZ)
+    {
+        MAIN_ErrorHandler();
+    }
+
+    if (HAL_RCC_GetPCLK1Freq() != DRIVER_EXPECTED_SYSCLK_HZ)
+    {
+        MAIN_ErrorHandler();
+    }
+}
+
 int main(void)
 {
     HAL_Init();
     SystemClock_Config();
+    MAIN_CheckClockTree();
 
     BOARD_InitStaticOutputs();
     BOARD_InitPwmOutputs();

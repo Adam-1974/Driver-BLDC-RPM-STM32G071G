@@ -4,6 +4,13 @@
 
 STM32G071GBU6, rdzen Cortex-M0+, taktowanie startowe 64 MHz z HSI + PLL.
 
+## Zegary
+
+- `SystemClock_Config()` ustawia 64 MHz z HSI 16 MHz przez PLL.
+- Po konfiguracji program sprawdza, czy SYSCLK/HCLK/PCLK1 maja 64 MHz.
+- TIM1 PWM i TIM6 tick sterowania sa przeliczane z aktualnego zegara RCC odczytanego przez HAL, a nie ze stalej kompilacji.
+- Celem jest unikniecie rozjazdu miedzy konfiguracja CubeIDE i reczna warstwa `board.c`.
+
 ## Tryby pracy
 
 1. SINUS

@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-#define DRIVER_SYSCLK_HZ                64000000u
+#define DRIVER_EXPECTED_SYSCLK_HZ       64000000u
 #define DRIVER_PWM_CARRIER_HZ           14000u
 #define DRIVER_CONTROL_LOOP_HZ          10000u
 #define DRIVER_SIN_TABLE_STEPS          256u
