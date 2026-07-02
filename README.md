@@ -21,13 +21,22 @@ Predkosc zadawana jest w RPM z rozdzielczoscia 1 RPM. Odczyt predkosci z BEMF je
 
 ## Najwazniejsze pliki
 
-- `Driver_BLDC_RPM_STM32G071G.ioc` - punkt startowy konfiguracji CubeMX/CubeIDE.
+- `Driver BLDC RPM (STM32G071G).ioc` - punkt startowy konfiguracji CubeMX/CubeIDE.
 - `Core/Inc/board.h` - mapa pinow projektu.
 - `Core/Inc/nvm_config.h` - jedna globalna struktura parametrow NVM.
 - `Core/Src/bemf_am32.c` - odczyt BEMF przeniesiony/adaptowany z AM32 dla STM32G071.
 - `docs/project_assumptions.md` - zalozenia projektu i decyzje.
 - `docs/hardware.md` - konfiguracja peryferiow i uwagi do pinow.
 - `docs/am32_bemf_notes.md` - notatki o integracji z AM32.
+
+
+## Lokalizacja projektu
+
+Wlasciwy katalog roboczy i jedyne repo Git:
+
+`D:\_PRACA\_PROJEKTY\JetEngine\Silnik kpl WT202606101250\_SOFTWARE\GIT\Driver BLDC RPM (STM32G071G)`
+
+Katalog z podkreslnikiem byl tymczasowa kopia robocza i nie jest juz uzywany.
 
 ## AM32
 
@@ -37,4 +46,5 @@ Fragmenty BEMF sa oznaczone w kodzie i pochodza z:
 https://github.com/am32-firmware/AM32
 
 AM32 jest licencjonowany jako GPL-3.0. Ten projekt przyjmuje licencje GPL-3.0-or-later dla plikow z kodem C.
+
 

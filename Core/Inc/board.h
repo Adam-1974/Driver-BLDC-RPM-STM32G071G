@@ -1,6 +1,8 @@
 #ifndef BOARD_H
 #define BOARD_H
 
+#include <stdint.h>
+
 #include "stm32g0xx_hal.h"
 #include "stm32g0xx_ll_comp.h"
 #include "stm32g0xx_ll_exti.h"
@@ -44,6 +46,11 @@
 #define BOARD_BEMF_COMP_PHASE_B_AM32    LL_COMP_INPUT_MINUS_IO1
 
 void BOARD_InitStaticOutputs(void);
+void BOARD_InitPwmOutputs(void);
+void BOARD_InitControlTick(void);
 void BOARD_AllPhasesOff(void);
+uint16_t BOARD_GetPwmPeriodTicks(void);
+void BOARD_SetHighPwm(uint16_t phase_a_ticks, uint16_t phase_b_ticks, uint16_t phase_c_ticks);
+void BOARD_SetLowSideState(uint8_t phase_a_on, uint8_t phase_b_on, uint8_t phase_c_on);
 
 #endif

@@ -39,7 +39,6 @@ void TIM6_DAC_LPTIM1_IRQHandler(void)
     if (LL_TIM_IsActiveFlag_UPDATE(TIM6) != 0u)
     {
         LL_TIM_ClearFlag_UPDATE(TIM6);
+        MOTOR_ControlTick10kHz();
     }
-
-    MOTOR_ControlTick1kHz();
 }
