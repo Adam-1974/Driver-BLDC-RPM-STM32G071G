@@ -20,5 +20,4 @@ Zachowane mechanizmy:
 Roznica projektu:
 
 - dodajemy opoznienie/przesuniecie wykonania kroku przez NVM `bemf_action_angle_offset_deg_x10`,
-- BEMF_B z listy pinow jest na PD1 i wymaga potwierdzenia, bo AM32 dla G071 przewiduje PB3 jako `LL_COMP_INPUT_MINUS_IO1`.
-
+- BEMF_B jest na pinie obudowy nr 23, czyli PB3 dla STM32G071GBU6 bez sufiksu `N`; pasuje to do `LL_COMP_INPUT_MINUS_IO1` uzywanego przez AM32.

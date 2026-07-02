@@ -12,10 +12,10 @@
 | PA9 | HB | TIM1_CH2 PWM |
 | PA10 | HA | TIM1_CH3 PWM |
 | PB0 | LB | GPIO output |
+| PB3 | BEMF_B | COMP2_INM, analog |
 | PB7 | BEMF_A | COMP2_INM, analog |
 | PB8 | LED WS2812B-2020 | GPIO output, pozniej TIM/DMA |
 | PB15 | LA | GPIO output |
-| PD1 | BEMF_B | analog, wymaga potwierdzenia komparatora |
 
 ## Timery
 
@@ -32,13 +32,10 @@ AM32 dla STM32G071 uzywa COMP2 z wejsciem dodatnim `LL_COMP_INPUT_PLUS_IO3`, czy
 - `LL_COMP_INPUT_MINUS_IO3` - PA2,
 - `LL_COMP_INPUT_MINUS_IO1` - PB3.
 
-Nasza lista pinow ma BEMF_B na PD1. W aktualnym naglowku LL dla STM32G071 uzywanym przez AM32 nie ma selektora komparatora dla PD1. To jest punkt do potwierdzenia przed layoutem lub przed pierwszym uruchomieniem:
+Na schemacie BEMF_B jest podlaczony do pinu obudowy nr 23. Dla STM32G071GBU6, czyli wersji UFQFPN28 bez sufiksu `N`, pin 23 to PB3. Wariant z pinem 23 jako PD1 dotyczy wersji `STM32G071GxUxN`.
 
-- przeniesc BEMF_B na PB3, jezeli ma dzialac identycznie jak AM32 na COMP2,
-- albo potwierdzic w dokumentacji STM32G071GBU6, ze PD1 ma alternatywne wejscie komparatora i dopisac selektor,
-- albo zrobic dla PD1 wariant ADC/analog watchdog, co nie bedzie juz kopia AM32.
+Wniosek: BEMF_B konfigurujemy jako PB3 / COMP2_INM, zgodnie z AM32.
 
 ## ADC
 
 PA5 jest skonfigurowane jako wejscie pomiaru pradu. Przeliczanie ADC -> mA jest parametrem NVM `adc_current_ma_per_count_q16`.
-

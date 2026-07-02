@@ -47,8 +47,9 @@ PB8.GPIO_Label=WS2812B_2020
 PB8.Signal=GPIO_Output
 PB15.GPIO_Label=LA
 PB15.Signal=GPIO_Output
-PD1.GPIO_Label=BEMF_B
-PD1.Signal=GPIO_Analog
+PB3.GPIO_Label=BEMF_B
+PB3.Mode=INM
+PB3.Signal=COMP2_INM
 TIM1.Channel-PWM\ Generation1\ CH1=TIM_CHANNEL_1
 TIM1.Channel-PWM\ Generation2\ CH2=TIM_CHANNEL_2
 TIM1.Channel-PWM\ Generation3\ CH3=TIM_CHANNEL_3
@@ -68,4 +69,3 @@ COMP2.Hysteresis=COMP_HYSTERESIS_NONE
 COMP2.OutputPol=COMP_OUTPUTPOL_NONINVERTED
 COMP2.PowerMode=COMP_POWERMODE_HIGHSPEED
 COMP2.IPParameters=InputPlus,InputMinus,Hysteresis,OutputPol,PowerMode
-

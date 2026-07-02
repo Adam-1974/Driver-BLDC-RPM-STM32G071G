@@ -22,8 +22,8 @@
 
 #define BOARD_PIN_BEMF_A                GPIO_PIN_7
 #define BOARD_PORT_BEMF_A               GPIOB
-#define BOARD_PIN_BEMF_B                GPIO_PIN_1
-#define BOARD_PORT_BEMF_B               GPIOD
+#define BOARD_PIN_BEMF_B                GPIO_PIN_3
+#define BOARD_PORT_BEMF_B               GPIOB
 #define BOARD_PIN_BEMF_C                GPIO_PIN_2
 #define BOARD_PORT_BEMF_C               GPIOA
 #define BOARD_PIN_BEMF_VGND             GPIO_PIN_3
@@ -47,4 +47,3 @@ void BOARD_InitStaticOutputs(void);
 void BOARD_AllPhasesOff(void);
 
 #endif
-

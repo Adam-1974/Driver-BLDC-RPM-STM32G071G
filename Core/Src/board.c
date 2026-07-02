@@ -6,7 +6,6 @@ void BOARD_InitStaticOutputs(void)
 
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
-    __HAL_RCC_GPIOD_CLK_ENABLE();
 
     gpio.Mode = GPIO_MODE_OUTPUT_PP;
     gpio.Pull = GPIO_NOPULL;
@@ -33,4 +32,3 @@ void BOARD_AllPhasesOff(void)
     HAL_GPIO_WritePin(BOARD_PORT_LB, BOARD_PIN_LB, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(BOARD_PORT_LC, BOARD_PIN_LC, GPIO_PIN_RESET);
 }
-
