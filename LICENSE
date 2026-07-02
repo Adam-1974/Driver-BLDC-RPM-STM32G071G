@@ -1,0 +1,11 @@
+GPL-3.0-or-later
+
+This project contains code derived from AM32
+(https://github.com/am32-firmware/AM32), which is licensed under GPL-3.0.
+
+Use, modification, and distribution of this project are permitted under the
+GNU General Public License version 3 or, at your option, any later version.
+
+The full license text is available at:
+https://www.gnu.org/licenses/gpl-3.0.txt
+

@@ -1,0 +1,22 @@
+# STM32CubeIDE / Eclipse
+/.metadata/
+/.settings/
+/Debug/
+/Release/
+/*.launch
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.su
+*.cyclo
+
+# Local/editor
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+
