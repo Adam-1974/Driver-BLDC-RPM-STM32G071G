@@ -40,7 +40,11 @@ STM32G071GBU6, rdzen Cortex-M0+, taktowanie startowe 64 MHz z HSI + PLL.
 
 ## Etap 10 - pierwszy rozruch SINUS open-loop
 
-- Sterownik po `MOTOR_Init()` startuje w trybie `MOTOR_MODE_SINUS`.
+- Aktualnie domyslnie wlaczony jest diagnostyczny `MOTOR_MODE_PHASE_TEST`.
+- Test przechodzi przez 6 statycznych wektorow: `A+B-`, `A+C-`, `B+C-`, `B+A-`, `C+A-`, `C+B-`.
+- Czas jednego wektora okresla `DRIVER_PHASE_TEST_STEP_MS`, a wypelnienie `DRIVER_PHASE_TEST_DUTY_PERMILLE`.
+- Celem testu jest potwierdzenie kolejnosci faz i wykrycie brakujacej galezi mocy przed dalszym strojeniem sinusa.
+- Po wylaczeniu `DRIVER_PHASE_TEST_ENABLED` sterownik po `MOTOR_Init()` startuje w trybie `MOTOR_MODE_SINUS`.
 - Predkosc rozruchowa jest stala w programie: `DRIVER_OPEN_LOOP_SINUS_RPM`.
 - Maksymalne wypelnienie PWM jest stale w programie: `DRIVER_OPEN_LOOP_MAX_DUTY_PERMILLE`.
 - Kierunek jest na razie staly: `MOTOR_DIRECTION_CW`.

@@ -69,6 +69,16 @@ static void MOTOR_UpdateSinusPwmLimit(void)
                                                 duty_permille) / 1000u);
 }
 
+static uint16_t MOTOR_GetDutyTicks(uint32_t duty_permille)
+{
+    if (duty_permille > 1000u)
+    {
+        duty_permille = 1000u;
+    }
+
+    return (uint16_t)(((uint32_t)BOARD_GetPwmPeriodTicks() * duty_permille) / 1000u);
+}
+
 static void MOTOR_UpdateSinusTiming(int32_t rpm_command)
 {
     const uint32_t rpm = MOTOR_GetAbsRpm(rpm_command);
@@ -148,9 +158,58 @@ static void MOTOR_ApplySinusBridge(void)
     BOARD_SetLowSideState(low_a, low_b, low_c);
 }
 
+static void MOTOR_ApplyPhaseTestVector(uint8_t step)
+{
+    const uint16_t duty_ticks = MOTOR_GetDutyTicks(DRIVER_PHASE_TEST_DUTY_PERMILLE);
+
+    BOARD_SetLowSideState(0u, 0u, 0u);
+    BOARD_SetHighPwm(0u, 0u, 0u);
+
+    switch (step % 6u)
+    {
+        case 0u:
+            BOARD_SetHighPwm(duty_ticks, 0u, 0u);
+            BOARD_SetLowSideState(0u, 1u, 0u);
+            break;
+
+        case 1u:
+            BOARD_SetHighPwm(duty_ticks, 0u, 0u);
+            BOARD_SetLowSideState(0u, 0u, 1u);
+            break;
+
+        case 2u:
+            BOARD_SetHighPwm(0u, duty_ticks, 0u);
+            BOARD_SetLowSideState(0u, 0u, 1u);
+            break;
+
+        case 3u:
+            BOARD_SetHighPwm(0u, duty_ticks, 0u);
+            BOARD_SetLowSideState(1u, 0u, 0u);
+            break;
+
+        case 4u:
+            BOARD_SetHighPwm(0u, 0u, duty_ticks);
+            BOARD_SetLowSideState(1u, 0u, 0u);
+            break;
+
+        default:
+            BOARD_SetHighPwm(0u, 0u, duty_ticks);
+            BOARD_SetLowSideState(0u, 1u, 0u);
+            break;
+    }
+}
+
 void MOTOR_Init(void)
 {
-    g_motor.mode = MOTOR_MODE_SINUS;
+    if (DRIVER_PHASE_TEST_ENABLED != 0u)
+    {
+        g_motor.mode = MOTOR_MODE_PHASE_TEST;
+    }
+    else
+    {
+        g_motor.mode = MOTOR_MODE_SINUS;
+    }
+
     g_motor.direction = MOTOR_DIRECTION_CW;
     g_motor.target_rpm = DRIVER_OPEN_LOOP_SINUS_RPM;
     g_motor.ramped_target_rpm = 0;
@@ -162,10 +221,17 @@ void MOTOR_Init(void)
     g_motor.sinus_table_index = 0u;
     g_motor.in_rpm = 0u;
     g_motor.bemf_readable = 0u;
-    g_motor.sixstep_step = 1u;
+    g_motor.sixstep_step = 0u;
 
     MOTOR_UpdateSinusPwmLimit();
     MOTOR_UpdateSinusTiming(0);
+
+    if (g_motor.mode == MOTOR_MODE_PHASE_TEST)
+    {
+        MOTOR_ApplyPhaseTestVector(g_motor.sixstep_step);
+        return;
+    }
+
     MOTOR_ApplySinusBridge();
 }
 
@@ -185,6 +251,12 @@ void MOTOR_SetTargetRpm(int32_t rpm, motor_direction_t direction)
 
 void MOTOR_ControlTick10kHz(void)
 {
+    if (g_motor.mode == MOTOR_MODE_PHASE_TEST)
+    {
+        MOTOR_PhaseTestStepIrq();
+        return;
+    }
+
     if (g_motor.mode == MOTOR_MODE_SINUS)
     {
         MOTOR_SinusStepIrq();
@@ -239,6 +311,43 @@ void MOTOR_SinusStepIrq(void)
     MOTOR_ApplySinusBridge();
     g_motor.measured_erpm = g_motor.ramped_target_rpm * (int32_t)MOTOR_GetPolePairs();
     g_motor.in_rpm = (g_motor.ramped_target_rpm == DRIVER_OPEN_LOOP_SINUS_RPM) ? 1u : 0u;
+}
+
+void MOTOR_PhaseTestStepIrq(void)
+{
+    const uint32_t step_ticks = (DRIVER_PHASE_TEST_STEP_MS * DRIVER_CONTROL_LOOP_HZ) / 1000u;
+
+    if (g_motor.mode != MOTOR_MODE_PHASE_TEST)
+    {
+        return;
+    }
+
+    if (step_ticks == 0u)
+    {
+        MOTOR_ApplyPhaseTestVector(g_motor.sixstep_step);
+        return;
+    }
+
+    if (g_motor.open_loop_tick >= step_ticks)
+    {
+        g_motor.open_loop_tick = 0u;
+        g_motor.sixstep_step++;
+
+        if (g_motor.sixstep_step >= 6u)
+        {
+            g_motor.sixstep_step = 0u;
+        }
+    }
+    else
+    {
+        g_motor.open_loop_tick++;
+    }
+
+    g_motor.target_rpm = 0;
+    g_motor.ramped_target_rpm = 0;
+    g_motor.measured_erpm = 0;
+    g_motor.in_rpm = 0u;
+    MOTOR_ApplyPhaseTestVector(g_motor.sixstep_step);
 }
 
 void MOTOR_BemfZeroCrossIrq(void)
