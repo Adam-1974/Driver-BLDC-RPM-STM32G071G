@@ -44,6 +44,8 @@ STM32G071GBU6, rdzen Cortex-M0+, taktowanie startowe 64 MHz z HSI + PLL.
 - Predkosc rozruchowa jest stala w programie: `DRIVER_OPEN_LOOP_SINUS_RPM`.
 - Maksymalne wypelnienie PWM jest stale w programie: `DRIVER_OPEN_LOOP_MAX_DUTY_PERMILLE`.
 - Kierunek jest na razie staly: `MOTOR_DIRECTION_CW`.
+- Rozruch zaczyna sie od fazy align: pole stoi przez `DRIVER_OPEN_LOOP_ALIGN_MS`, zeby ustawic wirnik w znanym polozeniu.
+- Po align predkosc rosnie od `DRIVER_OPEN_LOOP_START_RPM` do `DRIVER_OPEN_LOOP_SINUS_RPM` z rampa `DRIVER_OPEN_LOOP_RAMP_RPM_PER_SEC`.
 - TIM6 daje tick 10 kHz, a pozycja elektryczna jest prowadzona akumulatorem Q16.
 - Trzy probki tabeli sinus sa przesuniete o ok. 120/240 stopni elektrycznych. Najnizsza faza jest klamrowana dolna galezia do GND, pozostale fazy dostaja PWM wysokiej galezi ograniczony stalym limitem.
 - W tym etapie nie ma przejscia do 6-step, BEMF nie steruje komutacja, PID pradu jest odlozony na kolejny krok.

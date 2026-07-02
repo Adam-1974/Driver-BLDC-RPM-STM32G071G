@@ -69,9 +69,9 @@ static void MOTOR_UpdateSinusPwmLimit(void)
                                                 duty_permille) / 1000u);
 }
 
-static void MOTOR_UpdateSinusTiming(void)
+static void MOTOR_UpdateSinusTiming(int32_t rpm_command)
 {
-    const uint32_t rpm = MOTOR_GetAbsRpm(DRIVER_OPEN_LOOP_SINUS_RPM);
+    const uint32_t rpm = MOTOR_GetAbsRpm(rpm_command);
     const uint64_t numerator = (uint64_t)rpm * MOTOR_GetPolePairs() *
                                DRIVER_SIN_TABLE_STEPS * 65536u;
     const uint32_t denominator = 60u * DRIVER_CONTROL_LOOP_HZ;
@@ -83,6 +83,33 @@ static void MOTOR_UpdateSinusTiming(void)
     }
 
     g_motor.sinus_step_q16 = (uint32_t)(numerator / denominator);
+}
+
+static uint32_t MOTOR_GetAlignTicks(void)
+{
+    return (DRIVER_OPEN_LOOP_ALIGN_MS * DRIVER_CONTROL_LOOP_HZ) / 1000u;
+}
+
+static int32_t MOTOR_GetOpenLoopRampedRpm(uint32_t ramp_tick)
+{
+    const uint32_t target_rpm = MOTOR_GetAbsRpm(DRIVER_OPEN_LOOP_SINUS_RPM);
+    const uint32_t start_rpm = MOTOR_GetAbsRpm(DRIVER_OPEN_LOOP_START_RPM);
+    uint32_t rpm;
+
+    if (target_rpm <= start_rpm)
+    {
+        return (int32_t)target_rpm;
+    }
+
+    rpm = start_rpm + ((ramp_tick * DRIVER_OPEN_LOOP_RAMP_RPM_PER_SEC) /
+                       DRIVER_CONTROL_LOOP_HZ);
+
+    if (rpm > target_rpm)
+    {
+        rpm = target_rpm;
+    }
+
+    return (int32_t)rpm;
 }
 
 static void MOTOR_ApplySinusBridge(void)
@@ -126,10 +153,11 @@ void MOTOR_Init(void)
     g_motor.mode = MOTOR_MODE_SINUS;
     g_motor.direction = MOTOR_DIRECTION_CW;
     g_motor.target_rpm = DRIVER_OPEN_LOOP_SINUS_RPM;
-    g_motor.ramped_target_rpm = DRIVER_OPEN_LOOP_SINUS_RPM;
+    g_motor.ramped_target_rpm = 0;
     g_motor.measured_erpm = 0;
     g_motor.sinus_angle_q16 = 0u;
     g_motor.sinus_step_q16 = 0u;
+    g_motor.open_loop_tick = 0u;
     g_motor.sinus_pwm_limit_ticks = 0u;
     g_motor.sinus_table_index = 0u;
     g_motor.in_rpm = 0u;
@@ -137,7 +165,7 @@ void MOTOR_Init(void)
     g_motor.sixstep_step = 1u;
 
     MOTOR_UpdateSinusPwmLimit();
-    MOTOR_UpdateSinusTiming();
+    MOTOR_UpdateSinusTiming(0);
     MOTOR_ApplySinusBridge();
 }
 
@@ -147,9 +175,12 @@ void MOTOR_SetTargetRpm(int32_t rpm, motor_direction_t direction)
     (void)direction;
 
     g_motor.target_rpm = DRIVER_OPEN_LOOP_SINUS_RPM;
-    g_motor.ramped_target_rpm = DRIVER_OPEN_LOOP_SINUS_RPM;
+    g_motor.ramped_target_rpm = 0;
     g_motor.direction = MOTOR_DIRECTION_CW;
-    MOTOR_UpdateSinusTiming();
+    g_motor.open_loop_tick = 0u;
+    g_motor.sinus_angle_q16 = 0u;
+    g_motor.sinus_table_index = 0u;
+    MOTOR_UpdateSinusTiming(0);
 }
 
 void MOTOR_ControlTick10kHz(void)
@@ -166,6 +197,8 @@ void MOTOR_ControlTick10kHz(void)
 void MOTOR_SinusStepIrq(void)
 {
     const uint32_t full_turn_q16 = DRIVER_SIN_TABLE_STEPS * 65536u;
+    const uint32_t align_ticks = MOTOR_GetAlignTicks();
+    uint32_t ramp_tick;
 
     if (g_motor.mode != MOTOR_MODE_SINUS)
     {
@@ -178,6 +211,23 @@ void MOTOR_SinusStepIrq(void)
         return;
     }
 
+    if (g_motor.open_loop_tick < align_ticks)
+    {
+        g_motor.open_loop_tick++;
+        g_motor.ramped_target_rpm = 0;
+        g_motor.measured_erpm = 0;
+        g_motor.sinus_angle_q16 = 0u;
+        g_motor.sinus_table_index = 0u;
+        MOTOR_UpdateSinusTiming(0);
+        MOTOR_ApplySinusBridge();
+        return;
+    }
+
+    ramp_tick = g_motor.open_loop_tick - align_ticks;
+    g_motor.open_loop_tick++;
+    g_motor.ramped_target_rpm = MOTOR_GetOpenLoopRampedRpm(ramp_tick);
+    MOTOR_UpdateSinusTiming(g_motor.ramped_target_rpm);
+
     g_motor.sinus_angle_q16 += g_motor.sinus_step_q16;
 
     while (g_motor.sinus_angle_q16 >= full_turn_q16)
@@ -187,8 +237,8 @@ void MOTOR_SinusStepIrq(void)
 
     g_motor.sinus_table_index = (uint16_t)(g_motor.sinus_angle_q16 >> 16u);
     MOTOR_ApplySinusBridge();
-    g_motor.measured_erpm = DRIVER_OPEN_LOOP_SINUS_RPM * (int32_t)MOTOR_GetPolePairs();
-    g_motor.in_rpm = 1u;
+    g_motor.measured_erpm = g_motor.ramped_target_rpm * (int32_t)MOTOR_GetPolePairs();
+    g_motor.in_rpm = (g_motor.ramped_target_rpm == DRIVER_OPEN_LOOP_SINUS_RPM) ? 1u : 0u;
 }
 
 void MOTOR_BemfZeroCrossIrq(void)
