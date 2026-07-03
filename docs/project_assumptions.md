@@ -48,7 +48,8 @@ STM32G071GBU6, rdzen Cortex-M0+, taktowanie startowe 64 MHz z HSI + PLL.
 - Po align predkosc rosnie od `DRIVER_OPEN_LOOP_START_RPM` do `DRIVER_OPEN_LOOP_SINUS_RPM` z rampa `DRIVER_OPEN_LOOP_RAMP_RPM_PER_SEC`.
 - TIM6 daje tick 10 kHz, a pozycja elektryczna jest prowadzona akumulatorem Q16.
 - Przesuniecia faz B i C sa liczone w akumulatorze Q16 jako 120/240 stopni elektrycznych wzgledem fazy A.
-- Najnizsza faza jest klamrowana dolna galezia do GND, pozostale fazy dostaja PWM wysokiej galezi ograniczony stalym limitem.
+- Z trzech probek sinus wybierana jest najwyzsza faza jako `PWM`, najnizsza jako `LOW`, a faza srodkowa zostaje `FLOAT`.
+- To daje rzeczywista komutacje sektorowa PWM/LOW/FLOAT zgodna z podejsciem AM32 `comStep`, ale sterowana otwartopetlowym katem sinus.
 - W tym etapie nie ma przejscia do 6-step, BEMF nie steruje komutacja, PID pradu jest odlozony na kolejny krok.
 
 ## NVM
