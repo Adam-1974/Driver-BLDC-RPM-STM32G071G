@@ -6,21 +6,6 @@
 
 motor_control_state_t g_motor;
 
-typedef enum
-{
-    MOTOR_PHASE_A = 0,
-    MOTOR_PHASE_B = 1,
-    MOTOR_PHASE_C = 2
-} motor_phase_t;
-
-typedef struct
-{
-    motor_phase_t high_phase;
-    motor_phase_t low_phase;
-    uint16_t high_sample;
-    uint16_t low_sample;
-} motor_sinus_vector_t;
-
 static uint32_t MOTOR_GetAbsRpm(int32_t rpm)
 {
     if (rpm < 0)
@@ -46,46 +31,9 @@ static uint16_t MOTOR_GetSinusSample(uint16_t index)
     return g_sinus_table[index % DRIVER_SIN_TABLE_STEPS];
 }
 
-static void MOTOR_SelectSinusVector(uint16_t sample_a,
-                                    uint16_t sample_b,
-                                    uint16_t sample_c,
-                                    motor_sinus_vector_t *vector)
+static uint16_t MOTOR_ScaleSinusDuty(uint16_t sample)
 {
-    vector->high_phase = MOTOR_PHASE_A;
-    vector->high_sample = sample_a;
-    vector->low_phase = MOTOR_PHASE_A;
-    vector->low_sample = sample_a;
-
-    if (sample_b > vector->high_sample)
-    {
-        vector->high_phase = MOTOR_PHASE_B;
-        vector->high_sample = sample_b;
-    }
-
-    if (sample_c > vector->high_sample)
-    {
-        vector->high_phase = MOTOR_PHASE_C;
-        vector->high_sample = sample_c;
-    }
-
-    if (sample_b < vector->low_sample)
-    {
-        vector->low_phase = MOTOR_PHASE_B;
-        vector->low_sample = sample_b;
-    }
-
-    if (sample_c < vector->low_sample)
-    {
-        vector->low_phase = MOTOR_PHASE_C;
-        vector->low_sample = sample_c;
-    }
-}
-
-static uint16_t MOTOR_ScaleSinusVectorDuty(uint16_t high_sample, uint16_t low_sample)
-{
-    const uint32_t sample_span = (uint32_t)(high_sample - low_sample);
-
-    return (uint16_t)((sample_span * g_motor.sinus_pwm_limit_ticks) /
+    return (uint16_t)(((uint32_t)sample * g_motor.sinus_pwm_limit_ticks) /
                       DRIVER_SIN_TABLE_MAX_VALUE);
 }
 
@@ -156,51 +104,12 @@ static void MOTOR_ApplySinusBridge(void)
     const uint16_t sample_a = MOTOR_GetSinusSample(index_a);
     const uint16_t sample_b = MOTOR_GetSinusSample(index_b);
     const uint16_t sample_c = MOTOR_GetSinusSample(index_c);
-    motor_sinus_vector_t vector;
-    uint16_t duty_a = 0u;
-    uint16_t duty_b = 0u;
-    uint16_t duty_c = 0u;
-    uint8_t low_a = 0u;
-    uint8_t low_b = 0u;
-    uint8_t low_c = 0u;
-    uint16_t duty;
-
-    MOTOR_SelectSinusVector(sample_a, sample_b, sample_c, &vector);
-    duty = MOTOR_ScaleSinusVectorDuty(vector.high_sample, vector.low_sample);
-
-    switch (vector.high_phase)
-    {
-        case MOTOR_PHASE_A:
-            duty_a = duty;
-            break;
-
-        case MOTOR_PHASE_B:
-            duty_b = duty;
-            break;
-
-        default:
-            duty_c = duty;
-            break;
-    }
-
-    switch (vector.low_phase)
-    {
-        case MOTOR_PHASE_A:
-            low_a = 1u;
-            break;
-
-        case MOTOR_PHASE_B:
-            low_b = 1u;
-            break;
-
-        default:
-            low_c = 1u;
-            break;
-    }
+    const uint16_t duty_a = MOTOR_ScaleSinusDuty(sample_a);
+    const uint16_t duty_b = MOTOR_ScaleSinusDuty(sample_b);
+    const uint16_t duty_c = MOTOR_ScaleSinusDuty(sample_c);
 
     BOARD_SetLowSideState(0u, 0u, 0u);
     BOARD_SetHighPwm(duty_a, duty_b, duty_c);
-    BOARD_SetLowSideState(low_a, low_b, low_c);
 }
 
 void MOTOR_Init(void)

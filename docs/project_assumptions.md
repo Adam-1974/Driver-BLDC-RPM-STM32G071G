@@ -34,9 +34,9 @@ STM32G071GBU6, rdzen Cortex-M0+, taktowanie startowe 64 MHz z HSI + PLL.
 ## PWM
 
 - Startowo stala czestotliwosc nosna: 14 kHz.
-- Modulowana jest zawsze wysoka faza.
-- Dolna faza aktywna jest zapinana do GND.
-- Faza niepracujaca ma gorna i dolna galaz w stanie off, zeby mozna bylo mierzyc BEMF.
+- Docelowo w 6-step modulowana jest wysoka faza, dolna aktywna faza jest zapinana do GND, a faza niepracujaca ma gorna i dolna galaz off dla pomiaru BEMF.
+- W aktualnym etapie SINUS open-loop uzywane sa trzy kanaly PWM wysokich faz, zgodnie z podejsciem AM32 `allpwm`.
+- TIM1 pracuje z preload dla CCR1/CCR2/CCR3, zeby nowe wypelnienia trzech faz byly przenoszone przez zdarzenie update PWM.
 
 ## Etap 10 - pierwszy rozruch SINUS open-loop
 
@@ -48,8 +48,9 @@ STM32G071GBU6, rdzen Cortex-M0+, taktowanie startowe 64 MHz z HSI + PLL.
 - Po align predkosc rosnie od `DRIVER_OPEN_LOOP_START_RPM` do `DRIVER_OPEN_LOOP_SINUS_RPM` z rampa `DRIVER_OPEN_LOOP_RAMP_RPM_PER_SEC`.
 - TIM6 daje tick 10 kHz, a pozycja elektryczna jest prowadzona akumulatorem Q16.
 - Przesuniecia faz B i C sa liczone w akumulatorze Q16 jako 120/240 stopni elektrycznych wzgledem fazy A.
-- Z trzech probek sinus wybierana jest najwyzsza faza jako `PWM`, najnizsza jako `LOW`, a faza srodkowa zostaje `FLOAT`.
-- To daje rzeczywista komutacje sektorowa PWM/LOW/FLOAT zgodna z podejsciem AM32 `comStep`, ale sterowana otwartopetlowym katem sinus.
+- W trybie SINUS wszystkie trzy gorne fazy `HA/HB/HC` dostaja PWM z tabeli sinus, a `LA/LB/LC` pozostaja off.
+- Kazda probka sinus jest mnozona przez limit `DRIVER_OPEN_LOOP_MAX_DUTY_PERMILLE`, czyli przebieg jest skalowany do maksymalnego wypelnienia, a nie ucinany od gory.
+- Ten etap jest zgodny z podejsciem AM32 `stepper_sine/allpwm`: trzy przesuniete fazowo kanaly PWM dla startu sinusoidalnego.
 - W tym etapie nie ma przejscia do 6-step, BEMF nie steruje komutacja, PID pradu jest odlozony na kolejny krok.
 
 ## NVM
