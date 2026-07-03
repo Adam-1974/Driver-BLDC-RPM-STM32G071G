@@ -42,3 +42,22 @@ void TIM6_DAC_LPTIM1_IRQHandler(void)
         MOTOR_ControlTick10kHz();
     }
 }
+
+void TIM1_CC_IRQHandler(void)
+{
+    if (((TIM1->SR & TIM_SR_CC4IF) != 0u) &&
+        ((TIM1->DIER & TIM_DIER_CC4IE) != 0u))
+    {
+        TIM1->SR &= ~(TIM_SR_CC4IF | TIM_SR_CC4OF);
+        MOTOR_BemfPwmSampleIrq();
+    }
+}
+
+void TIM14_IRQHandler(void)
+{
+    if (LL_TIM_IsActiveFlag_UPDATE(TIM14) != 0u)
+    {
+        LL_TIM_ClearFlag_UPDATE(TIM14);
+        MOTOR_BemfCommutationTimerIrq();
+    }
+}

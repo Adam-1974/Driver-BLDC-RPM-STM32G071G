@@ -23,6 +23,7 @@ void BEMF_AM32_Init(volatile uint16_t *interval_counter,
     g_bemf_am32.current_exti_line = BOARD_BEMF_EXTI_LINE;
     g_bemf_am32.medium_speed_set = 0u;
     g_bemf_am32.expected_rising = 0u;
+    g_bemf_am32.filter_level = 5u;
     g_bemf_am32.interval_counter = interval_counter;
     g_bemf_am32.average_interval = average_interval;
     g_bemf_am32.zero_cross_callback = callback;
@@ -90,20 +91,50 @@ void BEMF_AM32_ChangeCompInput(uint8_t step, uint8_t rising)
     }
 }
 
+void BEMF_AM32_SetFilterLevel(uint8_t filter_level)
+{
+    if (filter_level == 0u)
+    {
+        filter_level = 1u;
+    }
+
+    if (filter_level > 16u)
+    {
+        filter_level = 16u;
+    }
+
+    g_bemf_am32.filter_level = filter_level;
+}
+
+static void BEMF_AM32_ClearEdgeFlag(uint8_t is_rising_flag)
+{
+    if (is_rising_flag != 0u)
+    {
+        LL_EXTI_ClearRisingFlag_0_31(LL_EXTI_LINE_18);
+        return;
+    }
+
+    LL_EXTI_ClearFallingFlag_0_31(LL_EXTI_LINE_18);
+}
+
 static void BEMF_AM32_HandleEdge(uint8_t is_rising_flag)
 {
-    const uint16_t interval = *g_bemf_am32.interval_counter;
+    const uint16_t interval = BOARD_GetBemfIntervalTicks();
     const uint16_t average_interval = *g_bemf_am32.average_interval;
+    uint8_t i;
+
+    *g_bemf_am32.interval_counter = interval;
 
     if (interval > (average_interval >> 1u))
     {
-        if (is_rising_flag != 0u)
+        BEMF_AM32_ClearEdgeFlag(is_rising_flag);
+
+        for (i = 0u; i < g_bemf_am32.filter_level; i++)
         {
-            LL_EXTI_ClearRisingFlag_0_31(LL_EXTI_LINE_18);
-        }
-        else
-        {
-            LL_EXTI_ClearFallingFlag_0_31(LL_EXTI_LINE_18);
+            if (BEMF_AM32_GetOutputLevel() == g_bemf_am32.expected_rising)
+            {
+                return;
+            }
         }
 
         if (g_bemf_am32.zero_cross_callback != 0)
@@ -116,14 +147,7 @@ static void BEMF_AM32_HandleEdge(uint8_t is_rising_flag)
 
     if (BEMF_AM32_GetOutputLevel() == g_bemf_am32.expected_rising)
     {
-        if (is_rising_flag != 0u)
-        {
-            LL_EXTI_ClearRisingFlag_0_31(LL_EXTI_LINE_18);
-        }
-        else
-        {
-            LL_EXTI_ClearFallingFlag_0_31(LL_EXTI_LINE_18);
-        }
+        BEMF_AM32_ClearEdgeFlag(is_rising_flag);
     }
 }
 

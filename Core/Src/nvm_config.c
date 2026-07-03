@@ -33,7 +33,7 @@ void NVM_SetDefaults(driver_nvm_config_t *config)
     config->sixstep_max_current_ma = 8000u;
     config->adc_current_ma_per_count_q16 = 65536u;
 
-    config->bemf_action_angle_offset_deg_x10 = 0;
+    config->bemf_action_angle_offset_deg_x10 = 100;
     config->reserved_alignment = 0;
 
     config->pid_sin_current = (pid_config_t){ .kp_q16 = 1 << 16, .ki_q16 = 0, .kd_q16 = 0, .out_min = 0, .out_max = 1000 };
@@ -68,4 +68,3 @@ void NVM_LoadOrDefault(void)
 
     NVM_SetDefaults(&g_driver_config);
 }
-

@@ -15,7 +15,7 @@
 #define BOARD_PIN_HC                    GPIO_PIN_8
 #define BOARD_PORT_HC                   GPIOA
 
-#define BOARD_PIN_LA                    GPIO_PIN_15
+#define BOARD_PIN_LA                    GPIO_PIN_1
 #define BOARD_PORT_LA                   GPIOB
 #define BOARD_PIN_LB                    GPIO_PIN_0
 #define BOARD_PORT_LB                   GPIOB
@@ -24,8 +24,10 @@
 
 #define BOARD_PIN_BEMF_A                GPIO_PIN_7
 #define BOARD_PORT_BEMF_A               GPIOB
-#define BOARD_PIN_BEMF_B                GPIO_PIN_3
-#define BOARD_PORT_BEMF_B               GPIOB
+#define BOARD_PIN_BEMF_B_AM32           GPIO_PIN_3
+#define BOARD_PORT_BEMF_B_AM32          GPIOB
+#define BOARD_PIN_BEMF_B                GPIO_PIN_1
+#define BOARD_PORT_BEMF_B               GPIOD
 #define BOARD_PIN_BEMF_C                GPIO_PIN_2
 #define BOARD_PORT_BEMF_C               GPIOA
 #define BOARD_PIN_BEMF_VGND             GPIO_PIN_3
@@ -47,10 +49,27 @@
 
 void BOARD_InitStaticOutputs(void);
 void BOARD_InitPwmOutputs(void);
+void BOARD_InitBemfComparator(void);
+void BOARD_InitBemfTiming(void);
 void BOARD_InitControlTick(void);
 void BOARD_AllPhasesOff(void);
 uint16_t BOARD_GetPwmPeriodTicks(void);
+uint16_t BOARD_GetBemfIntervalTicks(void);
+void BOARD_ResetBemfIntervalTimer(void);
+void BOARD_SetBemfIntervalTicks(uint16_t ticks);
+void BOARD_ScheduleBemfCommutation(uint16_t delay_ticks);
+void BOARD_DisableBemfCommutationTimer(void);
+void BOARD_SetBemfPwmSampleTicks(uint16_t ticks);
+void BOARD_EnableBemfPwmSampleIrq(uint8_t enabled);
+void BOARD_SetPwmBridgeEnabled(uint8_t enabled);
 void BOARD_SetHighPwm(uint16_t phase_a_ticks, uint16_t phase_b_ticks, uint16_t phase_c_ticks);
+void BOARD_SetPwmOutputMask(uint8_t phase_a_high,
+                            uint8_t phase_a_low,
+                            uint8_t phase_b_high,
+                            uint8_t phase_b_low,
+                            uint8_t phase_c_high,
+                            uint8_t phase_c_low);
 void BOARD_SetLowSideState(uint8_t phase_a_on, uint8_t phase_b_on, uint8_t phase_c_on);
+void BOARD_SetStatusLedColor(uint8_t red, uint8_t green, uint8_t blue);
 
 #endif

@@ -15,6 +15,7 @@ typedef struct
     uint32_t current_exti_line;
     uint8_t medium_speed_set;
     uint8_t expected_rising;
+    uint8_t filter_level;
     volatile uint16_t *interval_counter;
     volatile uint16_t *average_interval;
     bemf_zero_cross_callback_t zero_cross_callback;
@@ -29,6 +30,7 @@ uint8_t BEMF_AM32_GetOutputLevel(void);
 void BEMF_AM32_MaskPhaseInterrupts(void);
 void BEMF_AM32_EnableCompInterrupts(void);
 void BEMF_AM32_ChangeCompInput(uint8_t step, uint8_t rising);
+void BEMF_AM32_SetFilterLevel(uint8_t filter_level);
 void BEMF_AM32_IRQHandler(void);
 
 #endif
