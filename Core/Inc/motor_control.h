@@ -28,7 +28,6 @@ void MOTOR_Init(void);
 void MOTOR_SetTargetRpm(int32_t rpm, motor_direction_t direction);
 void MOTOR_ControlTick10kHz(void);
 void MOTOR_SinusStepIrq(void);
-void MOTOR_PhaseTestStepIrq(void);
 void MOTOR_BemfZeroCrossIrq(void);
 
 #endif

@@ -40,18 +40,15 @@ STM32G071GBU6, rdzen Cortex-M0+, taktowanie startowe 64 MHz z HSI + PLL.
 
 ## Etap 10 - pierwszy rozruch SINUS open-loop
 
-- Aktualnie domyslnie wlaczony jest diagnostyczny `MOTOR_MODE_PHASE_TEST`.
-- Test przechodzi przez 6 statycznych wektorow: `A+B-`, `A+C-`, `B+C-`, `B+A-`, `C+A-`, `C+B-`.
-- Czas jednego wektora okresla `DRIVER_PHASE_TEST_STEP_MS`, a wypelnienie `DRIVER_PHASE_TEST_DUTY_PERMILLE`.
-- Celem testu jest potwierdzenie kolejnosci faz i wykrycie brakujacej galezi mocy przed dalszym strojeniem sinusa.
-- Po wylaczeniu `DRIVER_PHASE_TEST_ENABLED` sterownik po `MOTOR_Init()` startuje w trybie `MOTOR_MODE_SINUS`.
+- Sterownik po `MOTOR_Init()` startuje w trybie `MOTOR_MODE_SINUS`.
 - Predkosc rozruchowa jest stala w programie: `DRIVER_OPEN_LOOP_SINUS_RPM`.
 - Maksymalne wypelnienie PWM jest stale w programie: `DRIVER_OPEN_LOOP_MAX_DUTY_PERMILLE`.
 - Kierunek jest na razie staly: `MOTOR_DIRECTION_CW`.
 - Rozruch zaczyna sie od fazy align: pole stoi przez `DRIVER_OPEN_LOOP_ALIGN_MS`, zeby ustawic wirnik w znanym polozeniu.
 - Po align predkosc rosnie od `DRIVER_OPEN_LOOP_START_RPM` do `DRIVER_OPEN_LOOP_SINUS_RPM` z rampa `DRIVER_OPEN_LOOP_RAMP_RPM_PER_SEC`.
 - TIM6 daje tick 10 kHz, a pozycja elektryczna jest prowadzona akumulatorem Q16.
-- Trzy probki tabeli sinus sa przesuniete o ok. 120/240 stopni elektrycznych. Najnizsza faza jest klamrowana dolna galezia do GND, pozostale fazy dostaja PWM wysokiej galezi ograniczony stalym limitem.
+- Przesuniecia faz B i C sa liczone w akumulatorze Q16 jako 120/240 stopni elektrycznych wzgledem fazy A.
+- Najnizsza faza jest klamrowana dolna galezia do GND, pozostale fazy dostaja PWM wysokiej galezi ograniczony stalym limitem.
 - W tym etapie nie ma przejscia do 6-step, BEMF nie steruje komutacja, PID pradu jest odlozony na kolejny krok.
 
 ## NVM
