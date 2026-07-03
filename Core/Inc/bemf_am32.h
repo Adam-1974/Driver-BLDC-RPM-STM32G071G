@@ -31,6 +31,7 @@ void BEMF_AM32_MaskPhaseInterrupts(void);
 void BEMF_AM32_EnableCompInterrupts(void);
 void BEMF_AM32_ChangeCompInput(uint8_t step, uint8_t rising);
 void BEMF_AM32_SetFilterLevel(uint8_t filter_level);
+uint8_t BEMF_AM32_ProcessIrq(void);
 void BEMF_AM32_IRQHandler(void);
 
 #endif

@@ -13,6 +13,12 @@
 
 #include "board.h"
 
+#if defined(__GNUC__)
+#define BEMF_FAST_CODE                  __attribute__((optimize("O2")))
+#else
+#define BEMF_FAST_CODE
+#endif
+
 bemf_am32_state_t g_bemf_am32;
 
 void BEMF_AM32_Init(volatile uint16_t *interval_counter,
@@ -29,24 +35,29 @@ void BEMF_AM32_Init(volatile uint16_t *interval_counter,
     g_bemf_am32.zero_cross_callback = callback;
 }
 
-uint8_t BEMF_AM32_GetOutputLevel(void)
+static BEMF_FAST_CODE uint8_t BEMF_AM32_ReadOutputLevel(COMP_TypeDef *comp)
 {
-    return (uint8_t)((g_bemf_am32.active_comp->CSR >> 30u) & 1u);
+    return (uint8_t)((comp->CSR >> 30u) & 1u);
 }
 
-void BEMF_AM32_MaskPhaseInterrupts(void)
+BEMF_FAST_CODE uint8_t BEMF_AM32_GetOutputLevel(void)
+{
+    return BEMF_AM32_ReadOutputLevel(g_bemf_am32.active_comp);
+}
+
+BEMF_FAST_CODE void BEMF_AM32_MaskPhaseInterrupts(void)
 {
     EXTI->IMR1 &= ~(1u << 18u);
     EXTI->RPR1 = LL_EXTI_LINE_18;
     EXTI->FPR1 = LL_EXTI_LINE_18;
 }
 
-void BEMF_AM32_EnableCompInterrupts(void)
+BEMF_FAST_CODE void BEMF_AM32_EnableCompInterrupts(void)
 {
     EXTI->IMR1 |= g_bemf_am32.current_exti_line;
 }
 
-void BEMF_AM32_ChangeCompInput(uint8_t step, uint8_t rising)
+BEMF_FAST_CODE void BEMF_AM32_ChangeCompInput(uint8_t step, uint8_t rising)
 {
     const uint16_t average_interval = *g_bemf_am32.average_interval;
 
@@ -106,7 +117,7 @@ void BEMF_AM32_SetFilterLevel(uint8_t filter_level)
     g_bemf_am32.filter_level = filter_level;
 }
 
-static void BEMF_AM32_ClearEdgeFlag(uint8_t is_rising_flag)
+static BEMF_FAST_CODE void BEMF_AM32_ClearEdgeFlag(uint8_t is_rising_flag)
 {
     if (is_rising_flag != 0u)
     {
@@ -117,10 +128,13 @@ static void BEMF_AM32_ClearEdgeFlag(uint8_t is_rising_flag)
     LL_EXTI_ClearFallingFlag_0_31(LL_EXTI_LINE_18);
 }
 
-static void BEMF_AM32_HandleEdge(uint8_t is_rising_flag)
+static BEMF_FAST_CODE uint8_t BEMF_AM32_HandleEdge(uint8_t is_rising_flag)
 {
+    COMP_TypeDef * const active_comp = g_bemf_am32.active_comp;
     const uint16_t interval = BOARD_GetBemfIntervalTicks();
     const uint16_t average_interval = *g_bemf_am32.average_interval;
+    const uint8_t expected_level = g_bemf_am32.expected_rising;
+    const uint8_t filter_level = g_bemf_am32.filter_level;
     uint8_t i;
 
     *g_bemf_am32.interval_counter = interval;
@@ -129,39 +143,47 @@ static void BEMF_AM32_HandleEdge(uint8_t is_rising_flag)
     {
         BEMF_AM32_ClearEdgeFlag(is_rising_flag);
 
-        for (i = 0u; i < g_bemf_am32.filter_level; i++)
+        for (i = 0u; i < filter_level; i++)
         {
-            if (BEMF_AM32_GetOutputLevel() == g_bemf_am32.expected_rising)
+            if (BEMF_AM32_ReadOutputLevel(active_comp) == expected_level)
             {
-                return;
+                return 0u;
             }
         }
 
-        if (g_bemf_am32.zero_cross_callback != 0)
-        {
-            g_bemf_am32.zero_cross_callback();
-        }
-
-        return;
+        return 1u;
     }
 
-    if (BEMF_AM32_GetOutputLevel() == g_bemf_am32.expected_rising)
+    if (BEMF_AM32_ReadOutputLevel(active_comp) == expected_level)
     {
         BEMF_AM32_ClearEdgeFlag(is_rising_flag);
     }
+
+    return 0u;
 }
 
-void BEMF_AM32_IRQHandler(void)
+BEMF_FAST_CODE uint8_t BEMF_AM32_ProcessIrq(void)
 {
     if (LL_EXTI_IsActiveFallingFlag_0_31(LL_EXTI_LINE_18))
     {
-        BEMF_AM32_HandleEdge(0u);
-        return;
+        return BEMF_AM32_HandleEdge(0u);
     }
 
     if (LL_EXTI_IsActiveRisingFlag_0_31(LL_EXTI_LINE_18))
     {
-        BEMF_AM32_HandleEdge(1u);
-        return;
+        return BEMF_AM32_HandleEdge(1u);
+    }
+
+    return 0u;
+}
+
+BEMF_FAST_CODE void BEMF_AM32_IRQHandler(void)
+{
+    if (BEMF_AM32_ProcessIrq() != 0u)
+    {
+        if (g_bemf_am32.zero_cross_callback != 0)
+        {
+            g_bemf_am32.zero_cross_callback();
+        }
     }
 }

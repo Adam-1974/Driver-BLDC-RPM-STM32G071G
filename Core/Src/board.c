@@ -5,7 +5,6 @@
 
 #define BOARD_COUNTER_CLOCK_HZ          1000000u
 #define BOARD_BEMF_TIMING_CLOCK_HZ      2000000u
-#define BOARD_WS2812_MAX_COLOR          32u
 #define BOARD_TIM_CCER_OUTPUT_MASK      (TIM_CCER_CC1E | TIM_CCER_CC1NE | \
                                          TIM_CCER_CC2E | TIM_CCER_CC2NE | \
                                          TIM_CCER_CC3E | TIM_CCER_CC3NE)
@@ -21,6 +20,8 @@
 #define BOARD_TIM_CH2_FORCE_INACTIVE    (TIM_CCMR1_OC2M_2 | TIM_CCMR1_OC2PE)
 #define BOARD_TIM_CH3_FORCE_INACTIVE    (TIM_CCMR2_OC3M_2 | TIM_CCMR2_OC3PE)
 
+static uint32_t s_pwm_timer_clock_hz;
+static uint32_t s_pwm_carrier_hz;
 static uint16_t s_pwm_period_ticks;
 
 #if defined(__GNUC__)
@@ -28,17 +29,6 @@ static uint16_t s_pwm_period_ticks;
 #else
 #define BOARD_FAST_CODE
 #endif
-
-#define BOARD_WS2812_HIGH()             (BOARD_PORT_WS2812->BSRR = BOARD_PIN_WS2812)
-#define BOARD_WS2812_LOW()              (BOARD_PORT_WS2812->BSRR = ((uint32_t)BOARD_PIN_WS2812 << 16u))
-#define BOARD_WS2812_NOP_4()            __NOP(); __NOP(); __NOP(); __NOP()
-#define BOARD_WS2812_NOP_8()            BOARD_WS2812_NOP_4(); BOARD_WS2812_NOP_4()
-#define BOARD_WS2812_NOP_16()           BOARD_WS2812_NOP_8(); BOARD_WS2812_NOP_8()
-#define BOARD_WS2812_NOP_32()           BOARD_WS2812_NOP_16(); BOARD_WS2812_NOP_16()
-#define BOARD_WS2812_T0H_DELAY()        BOARD_WS2812_NOP_16()
-#define BOARD_WS2812_T0L_DELAY()        BOARD_WS2812_NOP_32(); BOARD_WS2812_NOP_8()
-#define BOARD_WS2812_T1H_DELAY()        BOARD_WS2812_NOP_32(); BOARD_WS2812_NOP_8()
-#define BOARD_WS2812_T1L_DELAY()        BOARD_WS2812_NOP_16()
 
 static uint32_t BOARD_GetTimerClockHz(void)
 {
@@ -76,7 +66,7 @@ static uint16_t BOARD_CalcPeriodTicks(uint32_t timer_clock_hz, uint32_t target_h
     return (uint16_t)(period_ticks - 1u);
 }
 
-static uint16_t BOARD_LimitPwmTicks(uint16_t ticks)
+static BOARD_FAST_CODE uint16_t BOARD_LimitPwmTicks(uint16_t ticks)
 {
     if (ticks > s_pwm_period_ticks)
     {
@@ -86,17 +76,7 @@ static uint16_t BOARD_LimitPwmTicks(uint16_t ticks)
     return ticks;
 }
 
-static uint8_t BOARD_LimitStatusLedColor(uint8_t value)
-{
-    if (value > BOARD_WS2812_MAX_COLOR)
-    {
-        return BOARD_WS2812_MAX_COLOR;
-    }
-
-    return value;
-}
-
-static void BOARD_WriteLowSide(GPIO_TypeDef *port, uint16_t pin, uint8_t on)
+static BOARD_FAST_CODE void BOARD_WriteLowSide(GPIO_TypeDef *port, uint16_t pin, uint8_t on)
 {
     if (on != 0u)
     {
@@ -107,9 +87,9 @@ static void BOARD_WriteLowSide(GPIO_TypeDef *port, uint16_t pin, uint8_t on)
     port->BSRR = ((uint32_t)pin << 16u);
 }
 
-static void BOARD_SetTimerChannelModes(uint8_t phase_a_pwm,
-                                       uint8_t phase_b_pwm,
-                                       uint8_t phase_c_pwm)
+static BOARD_FAST_CODE void BOARD_SetTimerChannelModes(uint8_t phase_a_pwm,
+                                                       uint8_t phase_b_pwm,
+                                                       uint8_t phase_c_pwm)
 {
     uint32_t ccmr1 = TIM1->CCMR1;
     uint32_t ccmr2 = TIM1->CCMR2;
@@ -148,34 +128,6 @@ static void BOARD_SetTimerChannelModes(uint8_t phase_a_pwm,
     TIM1->CCMR2 = ccmr2;
 }
 
-static BOARD_FAST_CODE void BOARD_Ws2812WriteBit(uint8_t bit)
-{
-    if (bit != 0u)
-    {
-        BOARD_WS2812_HIGH();
-        BOARD_WS2812_T1H_DELAY();
-        BOARD_WS2812_LOW();
-        BOARD_WS2812_T1L_DELAY();
-        return;
-    }
-
-    BOARD_WS2812_HIGH();
-    BOARD_WS2812_T0H_DELAY();
-    BOARD_WS2812_LOW();
-    BOARD_WS2812_T0L_DELAY();
-}
-
-static BOARD_FAST_CODE void BOARD_Ws2812WriteByte(uint8_t value)
-{
-    uint8_t mask = 0x80u;
-
-    while (mask != 0u)
-    {
-        BOARD_Ws2812WriteBit((uint8_t)(value & mask));
-        mask >>= 1u;
-    }
-}
-
 void BOARD_InitStaticOutputs(void)
 {
     GPIO_InitTypeDef gpio = { 0 };
@@ -196,18 +148,16 @@ void BOARD_InitStaticOutputs(void)
     gpio.Pin = BOARD_PIN_LC;
     HAL_GPIO_Init(BOARD_PORT_LC, &gpio);
 
-    gpio.Pin = BOARD_PIN_WS2812;
-    HAL_GPIO_Init(BOARD_PORT_WS2812, &gpio);
-
     BOARD_AllPhasesOff();
 }
 
 void BOARD_InitPwmOutputs(void)
 {
     GPIO_InitTypeDef gpio = { 0 };
-    const uint32_t timer_clock_hz = BOARD_GetTimerClockHz();
 
-    s_pwm_period_ticks = BOARD_CalcPeriodTicks(timer_clock_hz, DRIVER_PWM_CARRIER_HZ);
+    s_pwm_timer_clock_hz = BOARD_GetTimerClockHz();
+    s_pwm_period_ticks = BOARD_CalcPeriodTicks(s_pwm_timer_clock_hz, DRIVER_PWM_CARRIER_HZ);
+    s_pwm_carrier_hz = s_pwm_timer_clock_hz / ((uint32_t)s_pwm_period_ticks + 1u);
 
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
@@ -370,22 +320,74 @@ uint16_t BOARD_GetPwmPeriodTicks(void)
     return s_pwm_period_ticks;
 }
 
-uint16_t BOARD_GetBemfIntervalTicks(void)
+uint32_t BOARD_GetPwmCarrierHz(void)
 {
+    return s_pwm_carrier_hz;
+}
+
+BOARD_FAST_CODE uint16_t BOARD_SetPwmCarrierHz(uint32_t carrier_hz)
+{
+    uint16_t period_ticks;
+
+    if (carrier_hz == 0u)
+    {
+        carrier_hz = DRIVER_PWM_CARRIER_HZ;
+    }
+
+    if (s_pwm_timer_clock_hz == 0u)
+    {
+        s_pwm_timer_clock_hz = BOARD_GetTimerClockHz();
+    }
+
+    period_ticks = BOARD_CalcPeriodTicks(s_pwm_timer_clock_hz, carrier_hz);
+
+    if (period_ticks == s_pwm_period_ticks)
+    {
+        return s_pwm_period_ticks;
+    }
+
+    s_pwm_period_ticks = period_ticks;
+    s_pwm_carrier_hz = s_pwm_timer_clock_hz / ((uint32_t)period_ticks + 1u);
+
+    TIM1->ARR = period_ticks;
+
+    if (TIM1->CNT > period_ticks)
+    {
+        TIM1->CNT = 0u;
+    }
+
+    TIM1->CCR1 = BOARD_LimitPwmTicks((uint16_t)TIM1->CCR1);
+    TIM1->CCR2 = BOARD_LimitPwmTicks((uint16_t)TIM1->CCR2);
+    TIM1->CCR3 = BOARD_LimitPwmTicks((uint16_t)TIM1->CCR3);
+    TIM1->CCR4 = BOARD_LimitPwmTicks((uint16_t)TIM1->CCR4);
+    TIM1->EGR = TIM_EGR_UG;
+
+    return s_pwm_period_ticks;
+}
+
+BOARD_FAST_CODE uint16_t BOARD_GetBemfIntervalTicks(void)
+{
+    if ((TIM2->SR & TIM_SR_UIF) != 0u)
+    {
+        return 0xFFFFu;
+    }
+
     return (uint16_t)TIM2->CNT;
 }
 
-void BOARD_ResetBemfIntervalTimer(void)
+BOARD_FAST_CODE void BOARD_ResetBemfIntervalTimer(void)
 {
+    TIM2->SR = 0u;
     TIM2->CNT = 0u;
 }
 
-void BOARD_SetBemfIntervalTicks(uint16_t ticks)
+BOARD_FAST_CODE void BOARD_SetBemfIntervalTicks(uint16_t ticks)
 {
+    TIM2->SR = 0u;
     TIM2->CNT = ticks;
 }
 
-void BOARD_ScheduleBemfCommutation(uint16_t delay_ticks)
+BOARD_FAST_CODE void BOARD_ScheduleBemfCommutation(uint16_t delay_ticks)
 {
     if (delay_ticks == 0u)
     {
@@ -399,13 +401,13 @@ void BOARD_ScheduleBemfCommutation(uint16_t delay_ticks)
     TIM14->DIER |= TIM_DIER_UIE;
 }
 
-void BOARD_DisableBemfCommutationTimer(void)
+BOARD_FAST_CODE void BOARD_DisableBemfCommutationTimer(void)
 {
     TIM14->DIER &= ~TIM_DIER_UIE;
     TIM14->SR = 0u;
 }
 
-void BOARD_SetBemfPwmSampleTicks(uint16_t ticks)
+BOARD_FAST_CODE void BOARD_SetBemfPwmSampleTicks(uint16_t ticks)
 {
     if (ticks == 0u)
     {
@@ -420,7 +422,7 @@ void BOARD_SetBemfPwmSampleTicks(uint16_t ticks)
     TIM1->CCR4 = ticks;
 }
 
-void BOARD_EnableBemfPwmSampleIrq(uint8_t enabled)
+BOARD_FAST_CODE void BOARD_EnableBemfPwmSampleIrq(uint8_t enabled)
 {
     TIM1->SR &= ~(TIM_SR_CC4IF | TIM_SR_CC4OF);
 
@@ -433,7 +435,7 @@ void BOARD_EnableBemfPwmSampleIrq(uint8_t enabled)
     TIM1->DIER &= ~TIM_DIER_CC4IE;
 }
 
-void BOARD_SetPwmBridgeEnabled(uint8_t enabled)
+BOARD_FAST_CODE void BOARD_SetPwmBridgeEnabled(uint8_t enabled)
 {
     if (enabled != 0u)
     {
@@ -449,19 +451,21 @@ void BOARD_SetPwmBridgeEnabled(uint8_t enabled)
     TIM1->BDTR &= ~TIM_BDTR_MOE;
 }
 
-void BOARD_SetHighPwm(uint16_t phase_a_ticks, uint16_t phase_b_ticks, uint16_t phase_c_ticks)
+BOARD_FAST_CODE void BOARD_SetHighPwm(uint16_t phase_a_ticks,
+                                      uint16_t phase_b_ticks,
+                                      uint16_t phase_c_ticks)
 {
     TIM1->CCR3 = BOARD_LimitPwmTicks(phase_a_ticks);
     TIM1->CCR2 = BOARD_LimitPwmTicks(phase_b_ticks);
     TIM1->CCR1 = BOARD_LimitPwmTicks(phase_c_ticks);
 }
 
-void BOARD_SetPwmOutputMask(uint8_t phase_a_high,
-                            uint8_t phase_a_low,
-                            uint8_t phase_b_high,
-                            uint8_t phase_b_low,
-                            uint8_t phase_c_high,
-                            uint8_t phase_c_low)
+BOARD_FAST_CODE void BOARD_SetPwmOutputMask(uint8_t phase_a_high,
+                                            uint8_t phase_a_low,
+                                            uint8_t phase_b_high,
+                                            uint8_t phase_b_low,
+                                            uint8_t phase_c_high,
+                                            uint8_t phase_c_low)
 {
     uint32_t ccer = TIM1->CCER;
 
@@ -490,28 +494,93 @@ void BOARD_SetPwmOutputMask(uint8_t phase_a_high,
     TIM1->CCER = ccer;
 }
 
-void BOARD_SetLowSideState(uint8_t phase_a_on, uint8_t phase_b_on, uint8_t phase_c_on)
+BOARD_FAST_CODE void BOARD_ApplySixStepBridge(uint8_t step,
+                                              uint16_t duty_ticks,
+                                              uint16_t bemf_sample_ticks)
+{
+    const uint16_t duty = BOARD_LimitPwmTicks(duty_ticks);
+    const uint16_t bemf_sample = BOARD_LimitPwmTicks(bemf_sample_ticks);
+    uint32_t ccmr1 = TIM1->CCMR1;
+    uint32_t ccmr2 = TIM1->CCMR2;
+    uint32_t ccer = TIM1->CCER;
+    uint16_t ccr1 = 0u;
+    uint16_t ccr2 = 0u;
+    uint16_t ccr3 = 0u;
+
+    ccmr1 &= ~(BOARD_TIM_CCMR1_CH1_MASK | BOARD_TIM_CCMR1_CH2_MASK);
+    ccmr2 &= ~BOARD_TIM_CCMR2_CH3_MASK;
+    ccer &= ~BOARD_TIM_CCER_OUTPUT_MASK;
+
+    switch (step)
+    {
+    case 1u:
+        ccr3 = duty;
+        ccmr1 |= BOARD_TIM_CH1_FORCE_INACTIVE | BOARD_TIM_CH2_FORCE_INACTIVE;
+        ccmr2 |= BOARD_TIM_CH3_PWM1;
+        ccer |= TIM_CCER_CC2NE;
+        break;
+
+    case 2u:
+        ccr1 = duty;
+        ccmr1 |= BOARD_TIM_CH1_PWM1 | BOARD_TIM_CH2_FORCE_INACTIVE;
+        ccmr2 |= BOARD_TIM_CH3_FORCE_INACTIVE;
+        ccer |= TIM_CCER_CC2NE;
+        break;
+
+    case 3u:
+        ccr1 = duty;
+        ccmr1 |= BOARD_TIM_CH1_PWM1 | BOARD_TIM_CH2_FORCE_INACTIVE;
+        ccmr2 |= BOARD_TIM_CH3_FORCE_INACTIVE;
+        ccer |= TIM_CCER_CC3NE;
+        break;
+
+    case 4u:
+        ccr2 = duty;
+        ccmr1 |= BOARD_TIM_CH1_FORCE_INACTIVE | BOARD_TIM_CH2_PWM1;
+        ccmr2 |= BOARD_TIM_CH3_FORCE_INACTIVE;
+        ccer |= TIM_CCER_CC3NE;
+        break;
+
+    case 5u:
+        ccr2 = duty;
+        ccmr1 |= BOARD_TIM_CH1_FORCE_INACTIVE | BOARD_TIM_CH2_PWM1;
+        ccmr2 |= BOARD_TIM_CH3_FORCE_INACTIVE;
+        ccer |= TIM_CCER_CC1NE;
+        break;
+
+    case 6u:
+        ccr3 = duty;
+        ccmr1 |= BOARD_TIM_CH1_FORCE_INACTIVE | BOARD_TIM_CH2_FORCE_INACTIVE;
+        ccmr2 |= BOARD_TIM_CH3_PWM1;
+        ccer |= TIM_CCER_CC1NE;
+        break;
+
+    default:
+        TIM1->BDTR &= ~TIM_BDTR_MOE;
+        return;
+    }
+
+    TIM1->CCR1 = ccr1;
+    TIM1->CCR2 = ccr2;
+    TIM1->CCR3 = ccr3;
+    TIM1->CCR4 = bemf_sample;
+    TIM1->CCER &= ~BOARD_TIM_CCER_OUTPUT_MASK;
+    TIM1->CCMR1 = ccmr1;
+    TIM1->CCMR2 = ccmr2;
+    TIM1->CCER = ccer | TIM_CCER_CC1E | TIM_CCER_CC2E | TIM_CCER_CC3E;
+
+    if ((TIM1->BDTR & TIM_BDTR_MOE) == 0u)
+    {
+        TIM1->EGR = TIM_EGR_UG;
+        TIM1->BDTR |= TIM_BDTR_MOE;
+    }
+}
+
+BOARD_FAST_CODE void BOARD_SetLowSideState(uint8_t phase_a_on,
+                                           uint8_t phase_b_on,
+                                           uint8_t phase_c_on)
 {
     BOARD_WriteLowSide(BOARD_PORT_LA, BOARD_PIN_LA, phase_a_on);
     BOARD_WriteLowSide(BOARD_PORT_LB, BOARD_PIN_LB, phase_b_on);
     BOARD_WriteLowSide(BOARD_PORT_LC, BOARD_PIN_LC, phase_c_on);
-}
-
-void BOARD_SetStatusLedColor(uint8_t red, uint8_t green, uint8_t blue)
-{
-    const uint8_t safe_red = BOARD_LimitStatusLedColor(red);
-    const uint8_t safe_green = BOARD_LimitStatusLedColor(green);
-    const uint8_t safe_blue = BOARD_LimitStatusLedColor(blue);
-    const uint32_t primask = __get_PRIMASK();
-
-    __disable_irq();
-    BOARD_Ws2812WriteByte(safe_green);
-    BOARD_Ws2812WriteByte(safe_red);
-    BOARD_Ws2812WriteByte(safe_blue);
-    BOARD_WS2812_LOW();
-
-    if (primask == 0u)
-    {
-        __enable_irq();
-    }
 }

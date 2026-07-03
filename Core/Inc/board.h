@@ -37,9 +37,6 @@
 #define BOARD_PORT_CURRENT_FB           GPIOA
 #define BOARD_ADC_CURRENT_CHANNEL       ADC_CHANNEL_5
 
-#define BOARD_PIN_WS2812                GPIO_PIN_8
-#define BOARD_PORT_WS2812               GPIOB
-
 #define BOARD_BEMF_COMP                 COMP2
 #define BOARD_BEMF_EXTI_LINE            LL_EXTI_LINE_18
 #define BOARD_BEMF_COMP_PLUS            LL_COMP_INPUT_PLUS_IO3
@@ -54,6 +51,8 @@ void BOARD_InitBemfTiming(void);
 void BOARD_InitControlTick(void);
 void BOARD_AllPhasesOff(void);
 uint16_t BOARD_GetPwmPeriodTicks(void);
+uint32_t BOARD_GetPwmCarrierHz(void);
+uint16_t BOARD_SetPwmCarrierHz(uint32_t carrier_hz);
 uint16_t BOARD_GetBemfIntervalTicks(void);
 void BOARD_ResetBemfIntervalTimer(void);
 void BOARD_SetBemfIntervalTicks(uint16_t ticks);
@@ -69,7 +68,7 @@ void BOARD_SetPwmOutputMask(uint8_t phase_a_high,
                             uint8_t phase_b_low,
                             uint8_t phase_c_high,
                             uint8_t phase_c_low);
+void BOARD_ApplySixStepBridge(uint8_t step, uint16_t duty_ticks, uint16_t bemf_sample_ticks);
 void BOARD_SetLowSideState(uint8_t phase_a_on, uint8_t phase_b_on, uint8_t phase_c_on);
-void BOARD_SetStatusLedColor(uint8_t red, uint8_t green, uint8_t blue);
 
 #endif

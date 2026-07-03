@@ -12,6 +12,9 @@
 #define MOTOR_BEMF_PHASE_A_MASK         0x01u
 #define MOTOR_BEMF_PHASE_B_MASK         0x02u
 #define MOTOR_BEMF_PHASE_C_MASK         0x04u
+#define MOTOR_SIXSTEP_PHASE_OPEN_LOOP   0u
+#define MOTOR_SIXSTEP_PHASE_BEMF_ACQUIRE 1u
+#define MOTOR_SIXSTEP_PHASE_CLOSED_LOOP 2u
 
 typedef struct
 {
@@ -20,6 +23,7 @@ typedef struct
     int32_t target_rpm;
     int32_t ramped_target_rpm;
     int32_t measured_erpm;
+    uint32_t pwm_carrier_hz;
     uint32_t sinus_angle_q16;
     uint32_t sinus_step_q16;
     uint32_t open_loop_tick;
@@ -44,13 +48,16 @@ typedef struct
     uint8_t bemf_blank_ticks;
     uint8_t bemf_poll_count;
     uint8_t bemf_zero_cross_count;
+    uint8_t bemf_slow_update_tick;
     uint8_t bemf_edge_seen;
     uint8_t bemf_armed;
     uint8_t bemf_phase_mask;
     uint8_t sixstep_bemf_closed_loop;
     uint8_t sixstep_commutation_pending;
     uint8_t sixstep_closed_loop_handoff_steps;
+    uint8_t sixstep_phase;
     uint8_t sixstep_step;
+    uint8_t pwm_pulses_per_sector;
     uint8_t bemf_led_phase;
     uint8_t bemf_led_phase_mask;
     uint8_t bemf_diag_phase;
