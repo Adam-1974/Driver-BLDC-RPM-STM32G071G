@@ -1,8 +1,11 @@
 #include "motor_control.h"
 
+#include <limits.h>
+
 #include "bemf_am32.h"
 #include "board.h"
 #include "nvm_config.h"
+#include "pid.h"
 #include "sinus_table.h"
 
 #define MOTOR_SIXSTEP_STEP_COUNT        6u
@@ -38,6 +41,7 @@
 #endif
 
 volatile motor_control_state_t g_motor;
+static pid_state_t s_sin_current_pid;
 
 static MOTOR_FAST_CODE void MOTOR_HandleBemfZeroCross(void);
 static MOTOR_FAST_CODE void MOTOR_EnableBemfCompIrqFromPwmSample(void);
@@ -124,16 +128,266 @@ static uint16_t MOTOR_GetPwmTicksFromPermille(uint32_t duty_permille)
     return (uint16_t)(((uint32_t)BOARD_GetPwmPeriodTicks() * duty_permille) / 1000u);
 }
 
-static uint16_t MOTOR_ScaleSinusDuty(uint16_t sample)
+static void MOTOR_UpdateSinusPwmMax(void)
 {
-    return (uint16_t)(((uint32_t)sample * g_motor.sinus_pwm_limit_ticks) /
-                      DRIVER_SIN_TABLE_MAX_VALUE);
+    g_motor.sinus_pwm_max_ticks =
+        MOTOR_GetPwmTicksFromPermille(DRIVER_OPEN_LOOP_MAX_DUTY_PERMILLE);
+
+    if (g_motor.sinus_pwm_ticks > g_motor.sinus_pwm_max_ticks)
+    {
+        g_motor.sinus_pwm_ticks = g_motor.sinus_pwm_max_ticks;
+    }
 }
 
-static void MOTOR_UpdateSinusPwmLimit(void)
+static uint16_t MOTOR_GetCurrentAdcSignal(uint16_t adc_raw)
 {
-    g_motor.sinus_pwm_limit_ticks =
-        MOTOR_GetPwmTicksFromPermille(DRIVER_OPEN_LOOP_MAX_DUTY_PERMILLE);
+    if (DRIVER_CURRENT_ADC_ZERO_OFFSET > DRIVER_CURRENT_ADC_MAX_VALUE)
+    {
+        return 0u;
+    }
+
+    if (adc_raw <= DRIVER_CURRENT_ADC_ZERO_OFFSET)
+    {
+        return 0u;
+    }
+
+    return (uint16_t)(adc_raw - DRIVER_CURRENT_ADC_ZERO_OFFSET);
+}
+
+static uint16_t MOTOR_GetCurrentAdcFromMilliAmps(uint32_t current_ma)
+{
+    const uint64_t denominator =
+        (uint64_t)DRIVER_CURRENT_ADC_FULL_SCALE_MA *
+        DRIVER_CURRENT_ADC_REFERENCE_MV;
+    uint64_t current_adc;
+
+    if (denominator == 0u)
+    {
+        return 0u;
+    }
+
+    current_adc = ((uint64_t)current_ma *
+                  DRIVER_CURRENT_ADC_FULL_SCALE_MV *
+                  DRIVER_CURRENT_ADC_MAX_VALUE) +
+                 (denominator >> 1u);
+    current_adc /= denominator;
+
+    if (current_adc > DRIVER_CURRENT_ADC_MAX_VALUE)
+    {
+        return (uint16_t)DRIVER_CURRENT_ADC_MAX_VALUE;
+    }
+
+    return (uint16_t)current_adc;
+}
+
+static uint32_t MOTOR_GetCurrentMilliAmpsFromAdc(uint16_t current_adc_signal)
+{
+    return (uint32_t)((((uint64_t)current_adc_signal *
+                        DRIVER_CURRENT_ADC_MA_PER_ADC_Q16) + 32768u) >> 16u);
+}
+
+static void MOTOR_UpdateCurrentMeasurementFromAdc(void)
+{
+    g_motor.current_adc_raw = BOARD_GetCurrentAdcRaw();
+    g_motor.current_adc_filtered = BOARD_GetCurrentAdcFiltered();
+    g_motor.current_adc_signal =
+        MOTOR_GetCurrentAdcSignal(g_motor.current_adc_filtered);
+    g_motor.measured_current_ma =
+        MOTOR_GetCurrentMilliAmpsFromAdc(g_motor.current_adc_signal);
+    g_motor.sin_current_error_adc =
+        (int32_t)g_motor.sin_current_target_adc -
+        (int32_t)g_motor.current_adc_signal;
+}
+
+static int32_t MOTOR_LimitSinusCurrentOutputPermille(int32_t output_permille)
+{
+    int32_t min_permille = s_sin_current_pid.config.out_min;
+    int32_t max_permille = s_sin_current_pid.config.out_max;
+    const int32_t duty_limit = (DRIVER_OPEN_LOOP_MAX_DUTY_PERMILLE > 1000u) ?
+                               1000 : (int32_t)DRIVER_OPEN_LOOP_MAX_DUTY_PERMILLE;
+
+    if (min_permille < 0)
+    {
+        min_permille = 0;
+    }
+
+    if ((max_permille <= 0) || (max_permille > duty_limit))
+    {
+        max_permille = duty_limit;
+    }
+
+    if (min_permille > max_permille)
+    {
+        min_permille = max_permille;
+    }
+
+    if (output_permille > max_permille)
+    {
+        return max_permille;
+    }
+
+    if (output_permille < min_permille)
+    {
+        return min_permille;
+    }
+
+    return output_permille;
+}
+
+static int32_t MOTOR_UpdateSinusCurrentPiPermille(int32_t current_error_adc)
+{
+    int64_t next_integrator = (int64_t)s_sin_current_pid.integrator +
+                              current_error_adc;
+    int64_t output_q16;
+    int64_t output_permille_64;
+    int32_t output_permille;
+    int32_t limited_permille;
+
+    if (next_integrator > INT32_MAX)
+    {
+        next_integrator = INT32_MAX;
+    }
+
+    if (next_integrator < INT32_MIN)
+    {
+        next_integrator = INT32_MIN;
+    }
+
+    output_q16 = ((int64_t)s_sin_current_pid.config.kp_q16 * current_error_adc);
+    output_q16 += ((int64_t)s_sin_current_pid.config.ki_q16 * (int32_t)next_integrator);
+    output_permille_64 = output_q16 >> 16;
+
+    if (output_permille_64 > INT32_MAX)
+    {
+        output_permille = INT32_MAX;
+    }
+    else if (output_permille_64 < INT32_MIN)
+    {
+        output_permille = INT32_MIN;
+    }
+    else
+    {
+        output_permille = (int32_t)output_permille_64;
+    }
+
+    limited_permille = MOTOR_LimitSinusCurrentOutputPermille(output_permille);
+
+    if ((output_permille == limited_permille) ||
+        ((output_permille > limited_permille) && (current_error_adc < 0)) ||
+        ((output_permille < limited_permille) && (current_error_adc > 0)))
+    {
+        s_sin_current_pid.integrator = (int32_t)next_integrator;
+    }
+
+    s_sin_current_pid.last_error = current_error_adc;
+
+    return limited_permille;
+}
+
+static void MOTOR_MoveSinusPwmToward(uint16_t target_ticks)
+{
+    uint16_t step_ticks = DRIVER_SIN_CURRENT_MAX_PWM_STEP_TICKS;
+    uint16_t actual_ticks = g_motor.sinus_pwm_ticks;
+
+    if (step_ticks == 0u)
+    {
+        step_ticks = 1u;
+    }
+
+    if (target_ticks > g_motor.sinus_pwm_max_ticks)
+    {
+        target_ticks = g_motor.sinus_pwm_max_ticks;
+    }
+
+    if (actual_ticks < target_ticks)
+    {
+        const uint16_t delta = target_ticks - actual_ticks;
+        actual_ticks += (delta > step_ticks) ? step_ticks : delta;
+    }
+    else if (actual_ticks > target_ticks)
+    {
+        const uint16_t delta = actual_ticks - target_ticks;
+        actual_ticks -= (delta > step_ticks) ? step_ticks : delta;
+    }
+
+    g_motor.sinus_pwm_ticks = actual_ticks;
+}
+
+static void MOTOR_ResetSinusCurrentControl(void)
+{
+    pid_config_t config = {
+        .kp_q16 = DRIVER_SIN_CURRENT_PID_KP_ADC_Q16,
+        .ki_q16 = DRIVER_SIN_CURRENT_PID_KI_ADC_Q16,
+        .kd_q16 = 0,
+        .out_min = DRIVER_SIN_CURRENT_PID_OUT_MIN_PERMILLE,
+        .out_max = DRIVER_SIN_CURRENT_PID_OUT_MAX_PERMILLE
+    };
+
+    BOARD_AllPhasesOff();
+
+    if (config.out_min < 0)
+    {
+        config.out_min = 0;
+    }
+
+    if ((config.out_max <= 0) || (config.out_max > 1000))
+    {
+        config.out_max = 1000;
+    }
+
+    config.kd_q16 = 0;
+    PID_Init(&s_sin_current_pid, &config);
+
+    g_motor.sin_current_target_ma = DRIVER_SIN_CURRENT_TARGET_MA;
+    g_motor.sin_current_target_adc =
+        MOTOR_GetCurrentAdcFromMilliAmps(g_motor.sin_current_target_ma);
+    g_motor.sin_current_control_tick = 0u;
+    g_motor.sinus_pwm_ticks = 0u;
+    g_motor.sin_current_pi_output_permille = 0u;
+    g_motor.sin_current_target_pwm_ticks = 0u;
+    g_motor.sin_current_error_adc = 0;
+    MOTOR_UpdateSinusPwmMax();
+
+    MOTOR_UpdateCurrentMeasurementFromAdc();
+}
+
+static void MOTOR_ServiceSinusCurrentControl(void)
+{
+    uint16_t divider_ticks = DRIVER_SIN_CURRENT_CONTROL_DIVIDER_TICKS;
+    int32_t target_permille;
+    uint16_t target_ticks;
+
+    if (divider_ticks == 0u)
+    {
+        divider_ticks = 1u;
+    }
+
+    if (g_motor.sin_current_control_tick < 0xFFFFu)
+    {
+        g_motor.sin_current_control_tick++;
+    }
+
+    if (g_motor.sin_current_control_tick < divider_ticks)
+    {
+        return;
+    }
+
+    g_motor.sin_current_control_tick = 0u;
+    g_motor.sin_current_update_count++;
+    MOTOR_UpdateCurrentMeasurementFromAdc();
+
+    target_permille =
+        MOTOR_UpdateSinusCurrentPiPermille(g_motor.sin_current_error_adc);
+    target_ticks = MOTOR_GetPwmTicksFromPermille((uint32_t)target_permille);
+    g_motor.sin_current_pi_output_permille = (uint16_t)target_permille;
+    g_motor.sin_current_target_pwm_ticks = target_ticks;
+    MOTOR_MoveSinusPwmToward(target_ticks);
+}
+
+static uint16_t MOTOR_ScaleSinusDuty(uint16_t sample)
+{
+    return (uint16_t)(((uint32_t)sample * g_motor.sinus_pwm_ticks) /
+                      DRIVER_SIN_TABLE_MAX_VALUE);
 }
 
 static void MOTOR_UpdateSixStepPwmLimit(void)
@@ -346,7 +600,7 @@ static void MOTOR_SetPwmCarrierHz(uint32_t carrier_hz)
         return;
     }
 
-    MOTOR_UpdateSinusPwmLimit();
+    MOTOR_UpdateSinusPwmMax();
     MOTOR_UpdateSixStepPwmLimit();
 }
 
@@ -1906,7 +2160,7 @@ static void MOTOR_EnterSixStepFromSinus(void)
     MOTOR_UpdateBemfFilterLevel();
     BOARD_DisableBemfCommutationTimer();
 
-    g_motor.sixstep_pwm_ticks = g_motor.sinus_pwm_limit_ticks;
+    g_motor.sixstep_pwm_ticks = g_motor.sinus_pwm_ticks;
 
     if (g_motor.sixstep_pwm_ticks > g_motor.sixstep_pwm_limit_ticks)
     {
@@ -2408,8 +2662,20 @@ void MOTOR_Init(void)
     g_motor.open_loop_tick = 0u;
     g_motor.sinus_at_target_ticks = 0u;
     g_motor.sixstep_run_ticks = 0u;
+    g_motor.sin_current_target_ma = DRIVER_SIN_CURRENT_TARGET_MA;
+    g_motor.measured_current_ma = 0u;
+    g_motor.control_tick_count = 0u;
+    g_motor.sin_current_update_count = 0u;
+    g_motor.sin_current_error_adc = 0;
     g_motor.sixstep_commutation_count = 0u;
-    g_motor.sinus_pwm_limit_ticks = 0u;
+    g_motor.current_adc_raw = 0u;
+    g_motor.current_adc_filtered = 0u;
+    g_motor.current_adc_signal = 0u;
+    g_motor.sin_current_target_adc = 0u;
+    g_motor.sinus_pwm_max_ticks = 0u;
+    g_motor.sinus_pwm_ticks = 0u;
+    g_motor.sin_current_pi_output_permille = 0u;
+    g_motor.sin_current_target_pwm_ticks = 0u;
     g_motor.sixstep_pwm_limit_ticks = 0u;
     g_motor.sixstep_pwm_ticks = 0u;
     g_motor.sixstep_interval_ticks = 0u;
@@ -2424,6 +2690,7 @@ void MOTOR_Init(void)
     g_motor.bemf_this_zc_ticks = 0u;
     g_motor.bemf_led_hold_ticks = 0u;
     g_motor.sinus_table_index = 0u;
+    g_motor.sin_current_control_tick = 0u;
     g_motor.in_rpm = 0u;
     g_motor.bemf_readable = 0u;
     g_motor.bemf_blank_ticks = 0u;
@@ -2454,7 +2721,7 @@ void MOTOR_Init(void)
                    MOTOR_BemfZeroCrossIrq);
     BEMF_AM32_MaskPhaseInterrupts();
     BEMF_AM32_SetFilterLevel(5u);
-    MOTOR_UpdateSinusPwmLimit();
+    MOTOR_ResetSinusCurrentControl();
     MOTOR_UpdateSixStepPwmLimit();
 
     if (MOTOR_isBemfLedDiagnosticMode())
@@ -2519,11 +2786,15 @@ void MOTOR_SetTargetRpm(int32_t rpm, motor_direction_t direction)
     BEMF_AM32_MaskPhaseInterrupts();
     BOARD_EnableBemfPwmSampleIrq(0u);
     BOARD_DisableBemfCommutationTimer();
+    MOTOR_ResetSinusCurrentControl();
     MOTOR_UpdateSinusTiming(0);
 }
 
 void MOTOR_ControlTick10kHz(void)
 {
+    BOARD_ServiceCurrentAdc();
+    g_motor.control_tick_count++;
+
     if (MOTOR_isBemfLedDiagnosticMode())
     {
         MOTOR_BemfLedDiagnosticTick();
@@ -2570,6 +2841,7 @@ void MOTOR_SinusStepIrq(void)
         g_motor.sinus_at_target_ticks = 0u;
         g_motor.sinus_table_index = 0u;
         MOTOR_UpdateSinusTiming(0);
+        MOTOR_ServiceSinusCurrentControl();
         MOTOR_ApplySinusBridge();
         return;
     }
@@ -2581,6 +2853,7 @@ void MOTOR_SinusStepIrq(void)
     MOTOR_AdvanceSinusAngle();
 
     g_motor.sinus_table_index = (uint16_t)(g_motor.sinus_angle_q16 >> 16u);
+    MOTOR_ServiceSinusCurrentControl();
     MOTOR_ApplySinusBridge();
     g_motor.measured_erpm = g_motor.ramped_target_rpm * (int32_t)MOTOR_GetPolePairs();
     g_motor.in_rpm = (g_motor.ramped_target_rpm == DRIVER_OPEN_LOOP_SINUS_RPM) ? 1u : 0u;

@@ -75,6 +75,7 @@ int main(void)
 
     BOARD_InitStaticOutputs();
     BOARD_InitPwmOutputs();
+    BOARD_InitCurrentAdc();
     BOARD_InitBemfComparator();
     BOARD_InitBemfTiming();
     NVM_LoadOrDefault();

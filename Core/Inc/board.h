@@ -33,9 +33,9 @@
 #define BOARD_PIN_BEMF_VGND             GPIO_PIN_3
 #define BOARD_PORT_BEMF_VGND            GPIOA
 
-#define BOARD_PIN_CURRENT_FB            GPIO_PIN_5
+#define BOARD_PIN_CURRENT_FB            GPIO_PIN_4
 #define BOARD_PORT_CURRENT_FB           GPIOA
-#define BOARD_ADC_CURRENT_CHANNEL       ADC_CHANNEL_5
+#define BOARD_ADC_CURRENT_CHANNEL       ADC_CHANNEL_4
 
 #define BOARD_BEMF_COMP                 COMP2
 #define BOARD_BEMF_EXTI_LINE            LL_EXTI_LINE_18
@@ -46,6 +46,8 @@
 
 void BOARD_InitStaticOutputs(void);
 void BOARD_InitPwmOutputs(void);
+void BOARD_InitCurrentAdc(void);
+void BOARD_ServiceCurrentAdc(void);
 void BOARD_InitBemfComparator(void);
 void BOARD_InitBemfTiming(void);
 void BOARD_InitControlTick(void);
@@ -70,5 +72,7 @@ void BOARD_SetPwmOutputMask(uint8_t phase_a_high,
                             uint8_t phase_c_low);
 void BOARD_ApplySixStepBridge(uint8_t step, uint16_t duty_ticks, uint16_t bemf_sample_ticks);
 void BOARD_SetLowSideState(uint8_t phase_a_on, uint8_t phase_b_on, uint8_t phase_c_on);
+uint16_t BOARD_GetCurrentAdcRaw(void);
+uint16_t BOARD_GetCurrentAdcFiltered(void);
 
 #endif

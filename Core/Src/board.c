@@ -1,6 +1,7 @@
 #include "board.h"
 
 #include "app_config.h"
+#include "stm32g0xx_hal_adc_ex.h"
 #include "stm32g0xx_ll_system.h"
 
 #define BOARD_COUNTER_CLOCK_HZ          1000000u
@@ -24,6 +25,14 @@
 static uint32_t s_pwm_timer_clock_hz;
 static uint32_t s_pwm_carrier_hz;
 static uint16_t s_pwm_period_ticks;
+static ADC_HandleTypeDef s_current_adc;
+static DMA_HandleTypeDef s_current_adc_dma;
+static volatile uint16_t s_current_adc_dma_sample;
+static uint16_t s_current_adc_raw;
+static uint16_t s_current_adc_filtered;
+static uint32_t s_current_adc_filter_accumulator;
+static uint8_t s_current_adc_ready;
+static uint8_t s_current_adc_filter_ready;
 
 #if defined(__GNUC__)
 #define BOARD_FAST_CODE                 __attribute__((optimize("O2")))
@@ -155,6 +164,43 @@ static BOARD_FAST_CODE void BOARD_SetTimerChannelModes(uint8_t phase_a_pwm,
     TIM1->CCMR2 = ccmr2;
 }
 
+static BOARD_FAST_CODE void BOARD_UpdateCurrentAdcFilter(uint16_t adc_raw)
+{
+    const uint8_t shift = DRIVER_CURRENT_ADC_IIR_SHIFT;
+    uint32_t filtered;
+
+    s_current_adc_raw = adc_raw;
+
+    if (shift == 0u)
+    {
+        s_current_adc_filtered = adc_raw;
+        s_current_adc_filter_accumulator = adc_raw;
+        s_current_adc_filter_ready = 1u;
+        return;
+    }
+
+    if (s_current_adc_filter_ready == 0u)
+    {
+        s_current_adc_filter_accumulator = (uint32_t)adc_raw << shift;
+        s_current_adc_filtered = adc_raw;
+        s_current_adc_filter_ready = 1u;
+        return;
+    }
+
+    filtered = s_current_adc_filter_accumulator >> shift;
+
+    if (adc_raw >= filtered)
+    {
+        s_current_adc_filter_accumulator += (uint32_t)adc_raw - filtered;
+    }
+    else
+    {
+        s_current_adc_filter_accumulator -= filtered - (uint32_t)adc_raw;
+    }
+
+    s_current_adc_filtered = (uint16_t)(s_current_adc_filter_accumulator >> shift);
+}
+
 void BOARD_InitStaticOutputs(void)
 {
     GPIO_InitTypeDef gpio = { 0 };
@@ -225,6 +271,96 @@ void BOARD_InitPwmOutputs(void)
 
     HAL_NVIC_SetPriority(TIM1_CC_IRQn, 0u, 0u);
     HAL_NVIC_EnableIRQ(TIM1_CC_IRQn);
+}
+
+void BOARD_InitCurrentAdc(void)
+{
+    ADC_ChannelConfTypeDef channel = { 0 };
+    GPIO_InitTypeDef gpio = { 0 };
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_ADC_CLK_ENABLE();
+    __HAL_RCC_DMA1_CLK_ENABLE();
+
+    gpio.Mode = GPIO_MODE_ANALOG;
+    gpio.Pull = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    gpio.Pin = BOARD_PIN_CURRENT_FB;
+    HAL_GPIO_Init(BOARD_PORT_CURRENT_FB, &gpio);
+
+    s_current_adc.Instance = ADC1;
+    s_current_adc.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+    s_current_adc.Init.Resolution = ADC_RESOLUTION_12B;
+    s_current_adc.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+    s_current_adc.Init.ScanConvMode = ADC_SCAN_DISABLE;
+    s_current_adc.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+    s_current_adc.Init.LowPowerAutoWait = DISABLE;
+    s_current_adc.Init.LowPowerAutoPowerOff = DISABLE;
+    s_current_adc.Init.ContinuousConvMode = ENABLE;
+    s_current_adc.Init.NbrOfConversion = 1u;
+    s_current_adc.Init.DiscontinuousConvMode = DISABLE;
+    s_current_adc.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+    s_current_adc.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+    s_current_adc.Init.DMAContinuousRequests = ENABLE;
+    s_current_adc.Init.Overrun = ADC_OVR_DATA_OVERWRITTEN;
+    s_current_adc.Init.SamplingTimeCommon1 = ADC_SAMPLETIME_160CYCLES_5;
+    s_current_adc.Init.SamplingTimeCommon2 = ADC_SAMPLETIME_160CYCLES_5;
+    s_current_adc.Init.OversamplingMode = DISABLE;
+    s_current_adc.Init.TriggerFrequencyMode = ADC_TRIGGER_FREQ_HIGH;
+
+    if (HAL_ADC_Init(&s_current_adc) != HAL_OK)
+    {
+        s_current_adc_ready = 0u;
+        return;
+    }
+
+    s_current_adc_dma.Instance = DMA1_Channel1;
+    s_current_adc_dma.Init.Request = DMA_REQUEST_ADC1;
+    s_current_adc_dma.Init.Direction = DMA_PERIPH_TO_MEMORY;
+    s_current_adc_dma.Init.PeriphInc = DMA_PINC_DISABLE;
+    s_current_adc_dma.Init.MemInc = DMA_MINC_DISABLE;
+    s_current_adc_dma.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;
+    s_current_adc_dma.Init.MemDataAlignment = DMA_MDATAALIGN_HALFWORD;
+    s_current_adc_dma.Init.Mode = DMA_CIRCULAR;
+    s_current_adc_dma.Init.Priority = DMA_PRIORITY_LOW;
+
+    if (HAL_DMA_Init(&s_current_adc_dma) != HAL_OK)
+    {
+        s_current_adc_ready = 0u;
+        return;
+    }
+
+    __HAL_LINKDMA(&s_current_adc, DMA_Handle, s_current_adc_dma);
+
+    if (HAL_ADCEx_Calibration_Start(&s_current_adc) != HAL_OK)
+    {
+        s_current_adc_ready = 0u;
+        return;
+    }
+
+    channel.Channel = BOARD_ADC_CURRENT_CHANNEL;
+    channel.Rank = ADC_REGULAR_RANK_1;
+    channel.SamplingTime = ADC_SAMPLINGTIME_COMMON_1;
+
+    if (HAL_ADC_ConfigChannel(&s_current_adc, &channel) != HAL_OK)
+    {
+        s_current_adc_ready = 0u;
+        return;
+    }
+
+    if (HAL_ADC_Start_DMA(&s_current_adc,
+                          (uint32_t *)(void *)&s_current_adc_dma_sample,
+                          1u) != HAL_OK)
+    {
+        s_current_adc_ready = 0u;
+        return;
+    }
+
+    __HAL_ADC_DISABLE_IT(&s_current_adc, ADC_IT_EOC | ADC_IT_EOS | ADC_IT_OVR);
+    __HAL_ADC_CLEAR_FLAG(&s_current_adc, ADC_FLAG_EOC | ADC_FLAG_EOS | ADC_FLAG_OVR);
+    DMA1_Channel1->CCR &= ~(DMA_CCR_TCIE | DMA_CCR_HTIE | DMA_CCR_TEIE);
+
+    s_current_adc_ready = 1u;
 }
 
 void BOARD_InitBemfComparator(void)
@@ -610,4 +746,24 @@ BOARD_FAST_CODE void BOARD_SetLowSideState(uint8_t phase_a_on,
     BOARD_WriteLowSide(BOARD_PORT_LA, BOARD_PIN_LA, phase_a_on);
     BOARD_WriteLowSide(BOARD_PORT_LB, BOARD_PIN_LB, phase_b_on);
     BOARD_WriteLowSide(BOARD_PORT_LC, BOARD_PIN_LC, phase_c_on);
+}
+
+BOARD_FAST_CODE void BOARD_ServiceCurrentAdc(void)
+{
+    if (s_current_adc_ready == 0u)
+    {
+        return;
+    }
+
+    BOARD_UpdateCurrentAdcFilter((uint16_t)(s_current_adc_dma_sample & 0x0FFFu));
+}
+
+BOARD_FAST_CODE uint16_t BOARD_GetCurrentAdcRaw(void)
+{
+    return s_current_adc_raw;
+}
+
+BOARD_FAST_CODE uint16_t BOARD_GetCurrentAdcFiltered(void)
+{
+    return s_current_adc_filtered;
 }

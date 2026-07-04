@@ -29,16 +29,8 @@ void NVM_SetDefaults(driver_nvm_config_t *config)
     config->sixstep_to_sin_hysteresis_rpm = 200u;
     config->in_rpm_window = 10u;
 
-    config->sin_current_ma = 1500u;
-    config->sixstep_max_current_ma = 8000u;
-    config->adc_current_ma_per_count_q16 = 65536u;
-
     config->bemf_action_angle_offset_deg_x10 = 100;
     config->reserved_alignment = 0;
-
-    config->pid_sin_current = (pid_config_t){ .kp_q16 = 1 << 16, .ki_q16 = 0, .kd_q16 = 0, .out_min = 0, .out_max = 1000 };
-    config->pid_sixstep_speed = (pid_config_t){ .kp_q16 = 1 << 16, .ki_q16 = 0, .kd_q16 = 0, .out_min = 0, .out_max = (int32_t)config->sixstep_max_current_ma };
-    config->pid_current_limit = (pid_config_t){ .kp_q16 = 1 << 16, .ki_q16 = 0, .kd_q16 = 0, .out_min = 0, .out_max = 1000 };
 
     config->crc32 = NVM_CalcPlaceholderCrc(config);
 }
