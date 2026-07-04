@@ -19,6 +19,7 @@
 #define BOARD_TIM_CH1_FORCE_INACTIVE    (TIM_CCMR1_OC1M_2 | TIM_CCMR1_OC1PE)
 #define BOARD_TIM_CH2_FORCE_INACTIVE    (TIM_CCMR1_OC2M_2 | TIM_CCMR1_OC2PE)
 #define BOARD_TIM_CH3_FORCE_INACTIVE    (TIM_CCMR2_OC3M_2 | TIM_CCMR2_OC3PE)
+#define BOARD_PWM_PERIOD_UPDATE_DEADBAND_TICKS 4u
 
 static uint32_t s_pwm_timer_clock_hz;
 static uint32_t s_pwm_carrier_hz;
@@ -74,6 +75,32 @@ static BOARD_FAST_CODE uint16_t BOARD_LimitPwmTicks(uint16_t ticks)
     }
 
     return ticks;
+}
+
+static BOARD_FAST_CODE uint8_t BOARD_isPwmPeriodInsideUpdateDeadband(uint16_t period_ticks)
+{
+    uint16_t period_diff;
+
+    if (s_pwm_period_ticks == 0u)
+    {
+        return 0u;
+    }
+
+    if (period_ticks > s_pwm_period_ticks)
+    {
+        period_diff = (uint16_t)(period_ticks - s_pwm_period_ticks);
+    }
+    else
+    {
+        period_diff = (uint16_t)(s_pwm_period_ticks - period_ticks);
+    }
+
+    if (period_diff <= BOARD_PWM_PERIOD_UPDATE_DEADBAND_TICKS)
+    {
+        return 1u;
+    }
+
+    return 0u;
 }
 
 static BOARD_FAST_CODE void BOARD_WriteLowSide(GPIO_TypeDef *port, uint16_t pin, uint8_t on)
@@ -341,7 +368,7 @@ BOARD_FAST_CODE uint16_t BOARD_SetPwmCarrierHz(uint32_t carrier_hz)
 
     period_ticks = BOARD_CalcPeriodTicks(s_pwm_timer_clock_hz, carrier_hz);
 
-    if (period_ticks == s_pwm_period_ticks)
+    if (BOARD_isPwmPeriodInsideUpdateDeadband(period_ticks) != 0u)
     {
         return s_pwm_period_ticks;
     }

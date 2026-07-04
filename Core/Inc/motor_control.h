@@ -15,6 +15,9 @@
 #define MOTOR_SIXSTEP_PHASE_OPEN_LOOP   0u
 #define MOTOR_SIXSTEP_PHASE_BEMF_ACQUIRE 1u
 #define MOTOR_SIXSTEP_PHASE_CLOSED_LOOP 2u
+#define MOTOR_SIXSTEP_PHASE_BEMF_COAST_WAIT 3u
+#define MOTOR_SIXSTEP_PHASE_ZERO_ALIGN  4u
+#define MOTOR_SIXSTEP_PHASE_ZERO_BEMF_WAIT 5u
 
 typedef struct
 {
@@ -34,6 +37,7 @@ typedef struct
     uint16_t sixstep_pwm_limit_ticks;
     uint16_t sixstep_pwm_ticks;
     uint16_t sixstep_interval_ticks;
+    uint16_t sixstep_fallback_interval_ticks;
     uint16_t sixstep_tick;
     uint16_t sixstep_speed_control_tick;
     uint16_t sixstep_bemf_delay_ticks;
@@ -57,6 +61,9 @@ typedef struct
     uint8_t sixstep_closed_loop_handoff_steps;
     uint8_t sixstep_phase;
     uint8_t sixstep_step;
+    uint8_t sixstep_handoff_coast_done;
+    uint8_t sixstep_relock_scan_steps;
+    uint8_t sixstep_missed_zc_blind_steps;
     uint8_t pwm_pulses_per_sector;
     uint8_t bemf_led_phase;
     uint8_t bemf_led_phase_mask;
