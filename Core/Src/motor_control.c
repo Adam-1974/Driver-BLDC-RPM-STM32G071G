@@ -11,10 +11,8 @@
 #define MOTOR_SIXSTEP_STEP_COUNT        6u
 #define MOTOR_BEMF_TIMER_HZ             2000000u
 #define MOTOR_BEMF_START_INTERVAL_TICKS 10000u
-#define MOTOR_BEMF_START_COUNTER_TICKS  5000u
 #define MOTOR_BEMF_FILTER_MIN_TICKS     100u
 #define MOTOR_BEMF_FILTER_MAX_TICKS     500u
-#define MOTOR_BEMF_PWM_OFF_SAMPLE_PERCENT 80u
 #define MOTOR_BEMF_SLOW_UPDATE_DIVIDER  16u
 #define MOTOR_BEMF_ADVANCE_RECIP_Q16    109u
 #define MOTOR_BEMF_DIRECT_COMMUTATION_TICKS 2u
@@ -25,14 +23,12 @@
 #define MOTOR_BEMF_ULTRA_FAST_BLANK_CONTROL_TICKS 0u
 #define MOTOR_BEMF_ULTRA_FAST_FILTER_LEVEL 2u
 #define MOTOR_BEMF_ERPM_NUMERATOR       ((MOTOR_BEMF_TIMER_HZ * 60u) / MOTOR_SIXSTEP_STEP_COUNT)
-#define MOTOR_BEMF_INTERVAL_AVERAGE_SHIFT 3u
-#define MOTOR_BEMF_FALLBACK_DECAY_NUMERATOR 33u
-#define MOTOR_BEMF_FALLBACK_DECAY_DENOMINATOR 32u
-#define MOTOR_BEMF_RELOCK_SCAN_STEP_LIMIT 12u
+#if DRIVER_SIXSTEP_BEMF_INTERVAL_IIR_SHIFT > 8u
+#define MOTOR_BEMF_INTERVAL_AVERAGE_SHIFT 8u
+#else
+#define MOTOR_BEMF_INTERVAL_AVERAGE_SHIFT DRIVER_SIXSTEP_BEMF_INTERVAL_IIR_SHIFT
+#endif
 #define MOTOR_PWM_PULSES_MAX_DISPLAY    255u
-#define MOTOR_BEMF_ALL_PHASES_MASK      (MOTOR_BEMF_PHASE_A_MASK | \
-                                         MOTOR_BEMF_PHASE_B_MASK | \
-                                         MOTOR_BEMF_PHASE_C_MASK)
 
 #if defined(__GNUC__)
 #define MOTOR_FAST_CODE                 __attribute__((optimize("O2")))
@@ -42,19 +38,26 @@
 
 volatile motor_control_state_t g_motor;
 static pid_state_t s_sin_current_pid;
+static pid_state_t s_sixstep_rpm_pid;
+static pid_state_t s_sixstep_current_limit_pid;
 
 static MOTOR_FAST_CODE void MOTOR_HandleBemfZeroCross(void);
-static MOTOR_FAST_CODE void MOTOR_EnableBemfCompIrqFromPwmSample(void);
+static MOTOR_FAST_CODE void MOTOR_ServiceBemfPwmGatingIrq(void);
+static MOTOR_FAST_CODE uint8_t MOTOR_StartBemfPwmGating(void);
+static MOTOR_FAST_CODE void MOTOR_StopBemfPwmGating(void);
 static MOTOR_FAST_CODE void MOTOR_CommitBemfCommutation(void);
+static MOTOR_FAST_CODE void MOTOR_EnableBemfClosedLoop(void);
 static MOTOR_FAST_CODE void MOTOR_ApplySixStepBridge(void);
+static MOTOR_FAST_CODE uint8_t MOTOR_GetBemfRisingForStep(void);
 static MOTOR_FAST_CODE void MOTOR_AdvanceSixStepStepIndex(void);
 static MOTOR_FAST_CODE void MOTOR_AdvanceSixStepStep(void);
 static MOTOR_FAST_CODE void MOTOR_ArmBemfForSixStep(void);
-static MOTOR_FAST_CODE void MOTOR_StartBemfRelockCoast(void);
-static MOTOR_FAST_CODE void MOTOR_StartBemfHandoffCoast(void);
-static uint32_t MOTOR_GetSixStepBemfArmDelayTicks(void);
-static MOTOR_FAST_CODE void MOTOR_ServiceBlindSixStepOpenLoopSpeedRamp(void);
-static MOTOR_FAST_CODE uint8_t MOTOR_ServiceBlindSixStepZeroStart(void);
+static MOTOR_FAST_CODE uint8_t MOTOR_ServiceBemfRecoveryOff(void);
+static MOTOR_FAST_CODE void MOTOR_EnterHardCurrentFault(void);
+static MOTOR_FAST_CODE uint8_t MOTOR_ServiceHardCurrentProtection(void);
+static void MOTOR_ResetBemfValidation(void);
+static void MOTOR_UpdateBemfMeasuredErpm(void);
+static void MOTOR_UpdateStatusLed(void);
 
 static uint32_t MOTOR_GetAbsRpm(int32_t rpm)
 {
@@ -81,24 +84,6 @@ static uint16_t MOTOR_GetSinusSample(uint16_t index)
     return g_sinus_table[index % DRIVER_SIN_TABLE_STEPS];
 }
 
-static MOTOR_FAST_CODE uint8_t MOTOR_isBlindSixStepTestMode(void)
-{
-#if DRIVER_TEST_BLIND_6STEP_ONLY
-    return 1u;
-#else
-    return 0u;
-#endif
-}
-
-static uint8_t MOTOR_isBemfLedDiagnosticMode(void)
-{
-#if DRIVER_BEMF_LED_DIAGNOSTIC_ONLY
-    return 1u;
-#else
-    return 0u;
-#endif
-}
-
 static MOTOR_FAST_CODE uint8_t MOTOR_isBemfMonitorOnlyMode(void)
 {
 #if DRIVER_SIXSTEP_BEMF_MONITOR_ONLY
@@ -108,14 +93,14 @@ static MOTOR_FAST_CODE uint8_t MOTOR_isBemfMonitorOnlyMode(void)
 #endif
 }
 
-static MOTOR_FAST_CODE uint8_t MOTOR_isBemfPwmGatedMode(void)
+static MOTOR_FAST_CODE uint8_t MOTOR_isBemfPwmGatingEnabled(void)
 {
-    if (g_motor.bemf_average_interval_ticks > DRIVER_SIXSTEP_BEMF_POLLING_CHANGEOVER_TICKS)
+    if (DRIVER_BEMF_PWM_GATING_MODE == DRIVER_BEMF_PWM_GATING_NONE)
     {
-        return 1u;
+        return 0u;
     }
 
-    return 0u;
+    return 1u;
 }
 
 static uint16_t MOTOR_GetPwmTicksFromPermille(uint32_t duty_permille)
@@ -197,6 +182,89 @@ static void MOTOR_UpdateCurrentMeasurementFromAdc(void)
     g_motor.sin_current_error_adc =
         (int32_t)g_motor.sin_current_target_adc -
         (int32_t)g_motor.current_adc_signal;
+}
+
+static void MOTOR_UpdateStatusLed(void)
+{
+    if (g_motor.hard_current_fault != 0u)
+    {
+        BOARD_SetStatusLed(BOARD_STATUS_LED_RED);
+        return;
+    }
+
+    if (g_motor.mode == MOTOR_MODE_SINUS)
+    {
+        BOARD_SetStatusLed(BOARD_STATUS_LED_GREEN);
+        return;
+    }
+
+    if ((g_motor.mode == MOTOR_MODE_SIXSTEP) &&
+        (g_motor.sixstep_bemf_closed_loop != 0u))
+    {
+        BOARD_SetStatusLed(BOARD_STATUS_LED_GREEN);
+    }
+}
+
+static MOTOR_FAST_CODE void MOTOR_EnterHardCurrentFault(void)
+{
+    MOTOR_ResetBemfValidation();
+    g_motor.hard_current_fault = 1u;
+    g_motor.hard_current_fault_count++;
+    g_motor.sixstep_bemf_closed_loop = 0u;
+    g_motor.sixstep_phase = MOTOR_SIXSTEP_PHASE_CURRENT_FAULT;
+    g_motor.sixstep_commutation_pending = 0u;
+    g_motor.sixstep_missed_zc_count = 0u;
+    g_motor.sixstep_virtual_zc_pending = 0u;
+    g_motor.bemf_edge_seen = 1u;
+    g_motor.bemf_armed = 0u;
+    g_motor.bemf_blank_ticks = 0u;
+    g_motor.bemf_interval_ticks = 0u;
+    g_motor.bemf_pwm_gating_open_ticks = 0u;
+    g_motor.bemf_pwm_gating_close_ticks = 0u;
+    g_motor.bemf_pwm_gating_close_pending = 0u;
+    g_motor.bemf_pwm_sample_valid = 0u;
+    g_motor.bemf_pwm_last_level = 0u;
+    g_motor.sixstep_pwm_ticks = 0u;
+    g_motor.sixstep_speed_pid_target_permille = 0u;
+    g_motor.sixstep_speed_pid_output_permille = 0u;
+    g_motor.sixstep_speed_pid_output_q16 = 0u;
+    g_motor.sixstep_speed_pid_rise_step_q16 = 0u;
+    g_motor.sixstep_speed_pid_fall_step_q16 = 0u;
+    g_motor.sixstep_final_pwm_permille = 0u;
+
+    BEMF_AM32_MaskPhaseInterrupts();
+    MOTOR_StopBemfPwmGating();
+    BOARD_DisableBemfCommutationTimer();
+    BOARD_ResetBemfIntervalTimer();
+    BOARD_AllPhasesOff();
+    BOARD_SetStatusLed(BOARD_STATUS_LED_RED);
+}
+
+static MOTOR_FAST_CODE uint8_t MOTOR_ServiceHardCurrentProtection(void)
+{
+    g_motor.hard_current_limit_ma = DRIVER_SIXSTEP_HARD_CURRENT_LIMIT_MA;
+    g_motor.hard_current_adc_threshold =
+        MOTOR_GetCurrentAdcFromMilliAmps(g_motor.hard_current_limit_ma);
+
+    if (g_motor.hard_current_fault != 0u)
+    {
+        BOARD_AllPhasesOff();
+        BOARD_SetStatusLed(BOARD_STATUS_LED_RED);
+        return 1u;
+    }
+
+    if (g_motor.hard_current_limit_ma == 0u)
+    {
+        return 0u;
+    }
+
+    if (g_motor.measured_current_ma > g_motor.hard_current_limit_ma)
+    {
+        MOTOR_EnterHardCurrentFault();
+        return 1u;
+    }
+
+    return 0u;
 }
 
 static int32_t MOTOR_LimitSinusCurrentOutputPermille(int32_t output_permille)
@@ -384,6 +452,421 @@ static void MOTOR_ServiceSinusCurrentControl(void)
     MOTOR_MoveSinusPwmToward(target_ticks);
 }
 
+static int32_t MOTOR_UpdatePidByError(pid_state_t *pid, int32_t error)
+{
+    int64_t next_integrator = (int64_t)pid->integrator + error;
+    int64_t output_q16;
+    int64_t output_64;
+    int32_t output;
+    int32_t limited_output;
+    const int32_t derivative = error - pid->last_error;
+
+    if (next_integrator > INT32_MAX)
+    {
+        next_integrator = INT32_MAX;
+    }
+
+    if (next_integrator < INT32_MIN)
+    {
+        next_integrator = INT32_MIN;
+    }
+
+    output_q16 = ((int64_t)pid->config.kp_q16 * error);
+    output_q16 += ((int64_t)pid->config.ki_q16 * (int32_t)next_integrator);
+    output_q16 += ((int64_t)pid->config.kd_q16 * derivative);
+    output_64 = output_q16 >> 16;
+
+    if (output_64 > INT32_MAX)
+    {
+        output = INT32_MAX;
+    }
+    else if (output_64 < INT32_MIN)
+    {
+        output = INT32_MIN;
+    }
+    else
+    {
+        output = (int32_t)output_64;
+    }
+
+    limited_output = output;
+
+    if (limited_output > pid->config.out_max)
+    {
+        limited_output = pid->config.out_max;
+    }
+
+    if (limited_output < pid->config.out_min)
+    {
+        limited_output = pid->config.out_min;
+    }
+
+    if ((output == limited_output) ||
+        ((output > limited_output) && (error < 0)) ||
+        ((output < limited_output) && (error > 0)))
+    {
+        pid->integrator = (int32_t)next_integrator;
+    }
+
+    pid->last_error = error;
+
+    return limited_output;
+}
+
+static uint16_t MOTOR_GetSixStepMaxDutyPermille(void)
+{
+    uint32_t max_permille = DRIVER_SIXSTEP_MAX_DUTY_PERMILLE;
+
+    if (max_permille > 1000u)
+    {
+        max_permille = 1000u;
+    }
+
+    return (uint16_t)max_permille;
+}
+
+static uint16_t MOTOR_LimitSixStepDutyPermille(uint32_t duty_permille)
+{
+    const uint16_t max_permille = MOTOR_GetSixStepMaxDutyPermille();
+
+    if (duty_permille > max_permille)
+    {
+        return max_permille;
+    }
+
+    return (uint16_t)duty_permille;
+}
+
+static uint16_t MOTOR_GetSixStepStartDutyPermille(void)
+{
+    return MOTOR_LimitSixStepDutyPermille(DRIVER_SIXSTEP_RPM_PID_START_DUTY_PERMILLE);
+}
+
+static uint32_t MOTOR_GetSixStepRpmPidSlewStepQ16(uint32_t slew_permille_per_sec,
+                                                  uint16_t divider_ticks)
+{
+    uint64_t step_q16;
+
+    if (slew_permille_per_sec == 0u)
+    {
+        return 0u;
+    }
+
+    if (divider_ticks == 0u)
+    {
+        divider_ticks = 1u;
+    }
+
+    step_q16 =
+        ((((uint64_t)slew_permille_per_sec * divider_ticks) << 16u) +
+         (DRIVER_CONTROL_LOOP_HZ - 1u)) / DRIVER_CONTROL_LOOP_HZ;
+
+    if (step_q16 == 0u)
+    {
+        step_q16 = 1u;
+    }
+
+    if (step_q16 > (1000u << 16u))
+    {
+        return (1000u << 16u);
+    }
+
+    return (uint32_t)step_q16;
+}
+
+static uint16_t MOTOR_MoveSixStepRpmPidOutputToward(uint16_t target_permille,
+                                                    uint32_t rise_step_q16,
+                                                    uint32_t fall_step_q16)
+{
+    uint32_t actual_q16 = g_motor.sixstep_speed_pid_output_q16;
+    uint32_t target_q16;
+
+    target_permille = MOTOR_LimitSixStepDutyPermille(target_permille);
+    target_q16 = (uint32_t)target_permille << 16u;
+
+    if (actual_q16 > (1000u << 16u))
+    {
+        actual_q16 = 1000u << 16u;
+    }
+
+    if (actual_q16 < target_q16)
+    {
+        const uint32_t delta_q16 = target_q16 - actual_q16;
+
+        if ((rise_step_q16 == 0u) || (delta_q16 <= rise_step_q16))
+        {
+            actual_q16 = target_q16;
+        }
+        else
+        {
+            actual_q16 += rise_step_q16;
+        }
+    }
+    else if (actual_q16 > target_q16)
+    {
+        const uint32_t delta_q16 = actual_q16 - target_q16;
+
+        if ((fall_step_q16 == 0u) || (delta_q16 <= fall_step_q16))
+        {
+            actual_q16 = target_q16;
+        }
+        else
+        {
+            actual_q16 -= fall_step_q16;
+        }
+    }
+
+    g_motor.sixstep_speed_pid_output_q16 = actual_q16;
+
+    return MOTOR_LimitSixStepDutyPermille((actual_q16 + 32768u) >> 16u);
+}
+
+static uint16_t MOTOR_GetSixStepPwmTicksFromPermille(uint16_t duty_permille)
+{
+    uint16_t pwm_ticks =
+        MOTOR_GetPwmTicksFromPermille(MOTOR_LimitSixStepDutyPermille(duty_permille));
+
+    if (pwm_ticks > g_motor.sixstep_pwm_limit_ticks)
+    {
+        pwm_ticks = g_motor.sixstep_pwm_limit_ticks;
+    }
+
+    return pwm_ticks;
+}
+
+static int32_t MOTOR_GetSixStepMeasuredMechanicalRpm(void)
+{
+    const uint16_t pole_pairs = MOTOR_GetPolePairs();
+
+    if (pole_pairs == 0u)
+    {
+        return g_motor.measured_erpm;
+    }
+
+    return g_motor.measured_erpm / (int32_t)pole_pairs;
+}
+
+static void MOTOR_ResetSixStepClosedLoopControl(void)
+{
+    const uint16_t start_permille = MOTOR_GetSixStepStartDutyPermille();
+    const uint16_t max_permille = MOTOR_GetSixStepMaxDutyPermille();
+    pid_config_t rpm_config = {
+        .kp_q16 = DRIVER_SIXSTEP_RPM_PID_KP_Q16,
+        .ki_q16 = DRIVER_SIXSTEP_RPM_PID_KI_Q16,
+        .kd_q16 = DRIVER_SIXSTEP_RPM_PID_KD_Q16,
+        .out_min = -(int32_t)start_permille,
+        .out_max = (int32_t)max_permille - (int32_t)start_permille
+    };
+    pid_config_t current_limit_config = {
+        .kp_q16 = DRIVER_SIXSTEP_CURRENT_LIMIT_PID_KP_Q16,
+        .ki_q16 = DRIVER_SIXSTEP_CURRENT_LIMIT_PID_KI_Q16,
+        .kd_q16 = 0,
+        .out_min = 0,
+        .out_max = max_permille
+    };
+
+    PID_Init(&s_sixstep_rpm_pid, &rpm_config);
+    PID_Init(&s_sixstep_current_limit_pid, &current_limit_config);
+
+    g_motor.sixstep_target_rpm = DRIVER_SIXSTEP_TARGET_RPM;
+    g_motor.sixstep_measured_rpm = MOTOR_GetSixStepMeasuredMechanicalRpm();
+    g_motor.sixstep_rpm_error =
+        g_motor.sixstep_target_rpm - g_motor.sixstep_measured_rpm;
+    g_motor.sixstep_current_limit_ma = DRIVER_SIXSTEP_CURRENT_LIMIT_MA;
+    g_motor.hard_current_limit_ma = DRIVER_SIXSTEP_HARD_CURRENT_LIMIT_MA;
+    g_motor.hard_current_adc_threshold = MOTOR_GetCurrentAdcFromMilliAmps(g_motor.hard_current_limit_ma);
+    g_motor.sixstep_current_error_ma = 0;
+    g_motor.sixstep_speed_control_tick = 0u;
+    g_motor.sixstep_current_limit_control_tick = 0u;
+    g_motor.sixstep_speed_update_count = 0u;
+    g_motor.sixstep_current_limit_update_count = 0u;
+    g_motor.sixstep_speed_pid_target_permille = start_permille;
+    g_motor.sixstep_speed_pid_output_permille = start_permille;
+    g_motor.sixstep_speed_pid_output_q16 = (uint32_t)start_permille << 16u;
+    g_motor.sixstep_speed_pid_rise_step_q16 = 0u;
+    g_motor.sixstep_speed_pid_fall_step_q16 = 0u;
+    g_motor.sixstep_current_limit_reduction_permille = 0u;
+    g_motor.sixstep_final_pwm_permille = start_permille;
+    g_motor.sixstep_pwm_ticks =
+        MOTOR_GetSixStepPwmTicksFromPermille(g_motor.sixstep_final_pwm_permille);
+}
+
+static uint8_t MOTOR_ServiceSixStepRpmPid(void)
+{
+    uint16_t divider_ticks = DRIVER_SIXSTEP_RPM_PID_UPDATE_DIVIDER_TICKS;
+    const uint16_t start_permille = MOTOR_GetSixStepStartDutyPermille();
+    uint16_t target_permille;
+    int32_t pid_delta_permille;
+    int32_t requested_permille;
+
+    if (divider_ticks == 0u)
+    {
+        divider_ticks = 1u;
+    }
+
+    if (g_motor.sixstep_speed_control_tick < 0xFFFFu)
+    {
+        g_motor.sixstep_speed_control_tick++;
+    }
+
+    if (g_motor.sixstep_speed_control_tick < divider_ticks)
+    {
+        return 0u;
+    }
+
+    g_motor.sixstep_speed_control_tick = 0u;
+    g_motor.sixstep_speed_update_count++;
+    MOTOR_UpdateBemfMeasuredErpm();
+    g_motor.sixstep_target_rpm = DRIVER_SIXSTEP_TARGET_RPM;
+    g_motor.sixstep_measured_rpm = MOTOR_GetSixStepMeasuredMechanicalRpm();
+    g_motor.sixstep_rpm_error =
+        g_motor.sixstep_target_rpm - g_motor.sixstep_measured_rpm;
+
+    pid_delta_permille =
+        MOTOR_UpdatePidByError(&s_sixstep_rpm_pid, g_motor.sixstep_rpm_error);
+    requested_permille = (int32_t)start_permille + pid_delta_permille;
+
+    if (requested_permille < 0)
+    {
+        requested_permille = 0;
+    }
+
+    target_permille =
+        MOTOR_LimitSixStepDutyPermille((uint32_t)requested_permille);
+
+    g_motor.sixstep_speed_pid_target_permille = target_permille;
+    g_motor.sixstep_speed_pid_rise_step_q16 =
+        MOTOR_GetSixStepRpmPidSlewStepQ16(
+            DRIVER_SIXSTEP_RPM_PID_MAX_RISE_PER_SEC_PERMILLE,
+            divider_ticks);
+    g_motor.sixstep_speed_pid_fall_step_q16 =
+        MOTOR_GetSixStepRpmPidSlewStepQ16(
+            DRIVER_SIXSTEP_RPM_PID_MAX_FALL_PER_SEC_PERMILLE,
+            divider_ticks);
+    g_motor.sixstep_speed_pid_output_permille =
+        MOTOR_MoveSixStepRpmPidOutputToward(
+            target_permille,
+            g_motor.sixstep_speed_pid_rise_step_q16,
+            g_motor.sixstep_speed_pid_fall_step_q16);
+
+    if (MOTOR_GetAbsRpm(g_motor.sixstep_rpm_error) <= g_driver_config.in_rpm_window)
+    {
+        g_motor.in_rpm = 1u;
+    }
+    else
+    {
+        g_motor.in_rpm = 0u;
+    }
+
+    return 1u;
+}
+
+static uint8_t MOTOR_ServiceSixStepCurrentLimiter(void)
+{
+    uint16_t divider_ticks = DRIVER_SIXSTEP_CURRENT_LIMIT_UPDATE_DIVIDER_TICKS;
+    uint16_t reduction_permille;
+
+    if (divider_ticks == 0u)
+    {
+        divider_ticks = 1u;
+    }
+
+    if (g_motor.sixstep_current_limit_control_tick < 0xFFFFu)
+    {
+        g_motor.sixstep_current_limit_control_tick++;
+    }
+
+    if (g_motor.sixstep_current_limit_control_tick < divider_ticks)
+    {
+        return 0u;
+    }
+
+    g_motor.sixstep_current_limit_control_tick = 0u;
+    g_motor.sixstep_current_limit_update_count++;
+    MOTOR_UpdateCurrentMeasurementFromAdc();
+    g_motor.sixstep_current_limit_ma = DRIVER_SIXSTEP_CURRENT_LIMIT_MA;
+    g_motor.sixstep_current_error_ma =
+        (int32_t)g_motor.measured_current_ma -
+        (int32_t)g_motor.sixstep_current_limit_ma;
+
+    if (g_motor.sixstep_current_error_ma <= 0)
+    {
+        uint16_t release_step = DRIVER_SIXSTEP_CURRENT_LIMIT_RELEASE_STEP_PERMILLE;
+
+        PID_Reset(&s_sixstep_current_limit_pid);
+
+        if (release_step == 0u)
+        {
+            release_step = 1u;
+        }
+
+        if (g_motor.sixstep_current_limit_reduction_permille > release_step)
+        {
+            g_motor.sixstep_current_limit_reduction_permille =
+                (uint16_t)(g_motor.sixstep_current_limit_reduction_permille -
+                           release_step);
+        }
+        else
+        {
+            g_motor.sixstep_current_limit_reduction_permille = 0u;
+        }
+
+        return 1u;
+    }
+
+    reduction_permille =
+        (uint16_t)MOTOR_UpdatePidByError(&s_sixstep_current_limit_pid,
+                                         g_motor.sixstep_current_error_ma);
+    g_motor.sixstep_current_limit_reduction_permille =
+        MOTOR_LimitSixStepDutyPermille(reduction_permille);
+
+    return 1u;
+}
+
+static void MOTOR_ApplySixStepClosedLoopPwmControl(void)
+{
+    uint16_t final_permille;
+    uint16_t pwm_ticks;
+
+    if (g_motor.sixstep_current_limit_reduction_permille >=
+        g_motor.sixstep_speed_pid_output_permille)
+    {
+        final_permille = 0u;
+    }
+    else
+    {
+        final_permille =
+            (uint16_t)(g_motor.sixstep_speed_pid_output_permille -
+                       g_motor.sixstep_current_limit_reduction_permille);
+    }
+
+    final_permille = MOTOR_LimitSixStepDutyPermille(final_permille);
+    pwm_ticks = MOTOR_GetSixStepPwmTicksFromPermille(final_permille);
+
+    g_motor.sixstep_final_pwm_permille = final_permille;
+
+    if (pwm_ticks == g_motor.sixstep_pwm_ticks)
+    {
+        return;
+    }
+
+    g_motor.sixstep_pwm_ticks = pwm_ticks;
+    MOTOR_ApplySixStepBridge();
+}
+
+static void MOTOR_ServiceSixStepClosedLoopPwmControl(void)
+{
+    (void)MOTOR_ServiceSixStepRpmPid();
+    (void)MOTOR_ServiceSixStepCurrentLimiter();
+
+    if (g_motor.sixstep_commutation_pending != 0u)
+    {
+        return;
+    }
+
+    MOTOR_ApplySixStepClosedLoopPwmControl();
+}
+
 static uint16_t MOTOR_ScaleSinusDuty(uint16_t sample)
 {
     return (uint16_t)(((uint32_t)sample * g_motor.sinus_pwm_ticks) /
@@ -393,102 +876,21 @@ static uint16_t MOTOR_ScaleSinusDuty(uint16_t sample)
 static void MOTOR_UpdateSixStepPwmLimit(void)
 {
     g_motor.sixstep_pwm_limit_ticks =
-        MOTOR_GetPwmTicksFromPermille(DRIVER_OPEN_LOOP_6STEP_MAX_DUTY_PERMILLE);
+        MOTOR_GetPwmTicksFromPermille(DRIVER_SIXSTEP_MAX_DUTY_PERMILLE);
 }
 
-static uint32_t MOTOR_GetBlindSixStepOpenLoopDutyPermille(void)
+static uint16_t MOTOR_GetSinToSixStepPwmTicks(void)
 {
-    if (g_motor.sixstep_phase == MOTOR_SIXSTEP_PHASE_ZERO_ALIGN)
+    uint32_t pwm_ticks =
+        ((uint32_t)g_motor.sinus_pwm_ticks *
+         DRIVER_SIN_TO_6STEP_PWM_SCALE_PERMILLE) / 1000u;
+
+    if (pwm_ticks > g_motor.sixstep_pwm_limit_ticks)
     {
-        return DRIVER_BLIND_6STEP_ALIGN_DUTY_PERMILLE;
+        pwm_ticks = g_motor.sixstep_pwm_limit_ticks;
     }
 
-    if (g_motor.sixstep_phase == MOTOR_SIXSTEP_PHASE_ZERO_BEMF_WAIT)
-    {
-        return DRIVER_BLIND_6STEP_KICK_DUTY_PERMILLE;
-    }
-
-    const uint32_t start_duty = DRIVER_BLIND_6STEP_DUTY_PERMILLE;
-    const uint32_t handoff_duty = DRIVER_BLIND_6STEP_HANDOFF_DUTY_PERMILLE;
-    const uint32_t ramp_ticks = MOTOR_GetSixStepBemfArmDelayTicks();
-    const uint32_t run_ticks = g_motor.sixstep_run_ticks;
-    uint32_t duty_delta;
-    uint32_t ramped_delta;
-
-    if ((ramp_ticks <= 1u) || (run_ticks >= ramp_ticks))
-    {
-        return handoff_duty;
-    }
-
-    if (handoff_duty >= start_duty)
-    {
-        duty_delta = handoff_duty - start_duty;
-        ramped_delta = (uint32_t)((((uint64_t)duty_delta * run_ticks) +
-                                   (ramp_ticks >> 1u)) / ramp_ticks);
-        return start_duty + ramped_delta;
-    }
-
-    duty_delta = start_duty - handoff_duty;
-    ramped_delta = (uint32_t)((((uint64_t)duty_delta * run_ticks) +
-                               (ramp_ticks >> 1u)) / ramp_ticks);
-
-    return start_duty - ramped_delta;
-}
-
-static uint8_t MOTOR_UpdateBlindSixStepPwm(void)
-{
-    const uint16_t next_pwm_ticks =
-        MOTOR_GetPwmTicksFromPermille(MOTOR_GetBlindSixStepOpenLoopDutyPermille());
-    const uint8_t changed =
-        ((g_motor.sixstep_pwm_limit_ticks != next_pwm_ticks) ||
-         (g_motor.sixstep_pwm_ticks != next_pwm_ticks)) ? 1u : 0u;
-
-    g_motor.sixstep_pwm_limit_ticks = next_pwm_ticks;
-    g_motor.sixstep_pwm_ticks = g_motor.sixstep_pwm_limit_ticks;
-
-    return changed;
-}
-
-static uint32_t MOTOR_GetBlindSixStepAlignTicks(void)
-{
-    const uint64_t ticks = ((uint64_t)DRIVER_BLIND_6STEP_ALIGN_MS *
-                            DRIVER_CONTROL_LOOP_HZ) / 1000u;
-
-    if (ticks == 0u)
-    {
-        return 1u;
-    }
-
-    if (ticks > 0xFFFFFFFFu)
-    {
-        return 0xFFFFFFFFu;
-    }
-
-    return (uint32_t)ticks;
-}
-
-static uint32_t MOTOR_GetBlindSixStepZeroBemfTimeoutTicks(void)
-{
-    const uint64_t ticks = ((uint64_t)DRIVER_BLIND_6STEP_ZERO_BEMF_TIMEOUT_MS *
-                            DRIVER_CONTROL_LOOP_HZ) / 1000u;
-
-    if (ticks == 0u)
-    {
-        return 1u;
-    }
-
-    if (ticks > 0xFFFFFFFFu)
-    {
-        return 0xFFFFFFFFu;
-    }
-
-    return (uint32_t)ticks;
-}
-
-static void MOTOR_UpdateBlindSixStepClosedLoopPwm(void)
-{
-    g_motor.sixstep_pwm_ticks =
-        MOTOR_GetPwmTicksFromPermille(DRIVER_BLIND_6STEP_CLOSED_LOOP_DUTY_PERMILLE);
+    return (uint16_t)pwm_ticks;
 }
 
 static uint16_t MOTOR_RescalePwmTicks(uint16_t ticks, uint16_t old_period, uint16_t new_period)
@@ -550,19 +952,6 @@ static void MOTOR_UpdatePwmCarrierDebug(uint16_t sector_ticks)
 
 static void MOTOR_RecalculateSixStepPwmAfterCarrierChange(uint16_t old_period, uint16_t new_period)
 {
-    if (MOTOR_isBlindSixStepTestMode())
-    {
-        if ((g_motor.sixstep_bemf_closed_loop != 0u) &&
-            (g_motor.sixstep_closed_loop_handoff_steps == 0u))
-        {
-            MOTOR_UpdateBlindSixStepClosedLoopPwm();
-            return;
-        }
-
-        (void)MOTOR_UpdateBlindSixStepPwm();
-        return;
-    }
-
     g_motor.sixstep_pwm_ticks =
         MOTOR_RescalePwmTicks(g_motor.sixstep_pwm_ticks, old_period, new_period);
     MOTOR_UpdateSixStepPwmLimit();
@@ -635,88 +1024,259 @@ static void MOTOR_RestoreDefaultPwmCarrier(void)
     g_motor.pwm_pulses_per_sector = 0u;
 }
 
-static MOTOR_FAST_CODE uint16_t MOTOR_GetBemfPwmSampleTicks(uint16_t duty_ticks)
+static MOTOR_FAST_CODE uint16_t MOTOR_GetPwmDutyPermilleFromTicks(uint16_t duty_ticks)
 {
     const uint16_t period_ticks = BOARD_GetPwmPeriodTicks();
-    uint32_t off_ticks;
-    uint32_t sample_ticks;
 
-    if (period_ticks <= 2u)
+    if (period_ticks == 0u)
+    {
+        return 0u;
+    }
+
+    if (duty_ticks >= period_ticks)
+    {
+        return 1000u;
+    }
+
+    return (uint16_t)((((uint32_t)duty_ticks * 1000u) +
+                       (period_ticks >> 1u)) / period_ticks);
+}
+
+static MOTOR_FAST_CODE uint8_t MOTOR_UpdateBemfPwmGatingActiveWindow(uint16_t duty_ticks)
+{
+    const uint8_t mode = DRIVER_BEMF_PWM_GATING_MODE;
+    uint16_t duty_permille;
+    uint16_t on_enter_permille = DRIVER_BEMF_PWM_SAMPLE_ON_ENTER_PERMILLE;
+    uint16_t on_exit_permille = DRIVER_BEMF_PWM_SAMPLE_ON_EXIT_PERMILLE;
+
+    if (mode == DRIVER_BEMF_PWM_GATING_OFF_TIME)
+    {
+        g_motor.bemf_pwm_gating_active_window = MOTOR_BEMF_PWM_SAMPLE_OFF_TIME;
+        return g_motor.bemf_pwm_gating_active_window;
+    }
+
+    if (mode == DRIVER_BEMF_PWM_GATING_ON_TIME)
+    {
+        g_motor.bemf_pwm_gating_active_window = MOTOR_BEMF_PWM_SAMPLE_ON_TIME;
+        return g_motor.bemf_pwm_gating_active_window;
+    }
+
+    if (on_enter_permille > 1000u)
+    {
+        on_enter_permille = 1000u;
+    }
+
+    if (on_exit_permille > on_enter_permille)
+    {
+        on_exit_permille = on_enter_permille;
+    }
+
+    duty_permille = MOTOR_GetPwmDutyPermilleFromTicks(duty_ticks);
+
+    if (g_motor.bemf_pwm_gating_active_window == MOTOR_BEMF_PWM_SAMPLE_ON_TIME)
+    {
+        if (duty_permille <= on_exit_permille)
+        {
+            g_motor.bemf_pwm_gating_active_window = MOTOR_BEMF_PWM_SAMPLE_OFF_TIME;
+        }
+
+        return g_motor.bemf_pwm_gating_active_window;
+    }
+
+    if (duty_permille >= on_enter_permille)
+    {
+        g_motor.bemf_pwm_gating_active_window = MOTOR_BEMF_PWM_SAMPLE_ON_TIME;
+    }
+    else
+    {
+        g_motor.bemf_pwm_gating_active_window = MOTOR_BEMF_PWM_SAMPLE_OFF_TIME;
+    }
+
+    return g_motor.bemf_pwm_gating_active_window;
+}
+
+static MOTOR_FAST_CODE uint8_t MOTOR_GetBemfPwmGatingTicksForWindow(uint8_t active_window,
+                                                                     uint16_t duty_ticks,
+                                                                     uint16_t *open_ticks,
+                                                                     uint16_t *close_ticks)
+{
+    const uint16_t period_ticks = BOARD_GetPwmPeriodTicks();
+    uint16_t edge_settle_ticks = DRIVER_BEMF_PWM_SAMPLE_EDGE_SETTLE_TICKS;
+    uint16_t close_margin_ticks = DRIVER_BEMF_PWM_SAMPLE_CLOSE_MARGIN_TICKS;
+    uint32_t open_tick;
+    uint32_t close_tick;
+
+    if ((open_ticks == 0) || (close_ticks == 0) || (period_ticks <= 4u))
+    {
+        return 0u;
+    }
+
+    if (duty_ticks > period_ticks)
+    {
+        duty_ticks = period_ticks;
+    }
+
+    if (edge_settle_ticks >= period_ticks)
+    {
+        edge_settle_ticks = (uint16_t)(period_ticks - 1u);
+    }
+
+    if (close_margin_ticks >= period_ticks)
+    {
+        close_margin_ticks = (uint16_t)(period_ticks - 1u);
+    }
+
+    if (active_window == MOTOR_BEMF_PWM_SAMPLE_ON_TIME)
+    {
+        open_tick = edge_settle_ticks;
+
+        if (duty_ticks <= close_margin_ticks)
+        {
+            return 0u;
+        }
+
+        close_tick = (uint32_t)duty_ticks - close_margin_ticks;
+    }
+    else
+    {
+        open_tick = (uint32_t)duty_ticks + edge_settle_ticks;
+
+        if (period_ticks <= close_margin_ticks)
+        {
+            return 0u;
+        }
+
+        close_tick = (uint32_t)period_ticks - close_margin_ticks;
+    }
+
+    if (open_tick == 0u)
+    {
+        open_tick = 1u;
+    }
+
+    if (close_tick >= period_ticks)
+    {
+        close_tick = (uint32_t)period_ticks - 1u;
+    }
+
+    if ((open_tick >= period_ticks) || (close_tick <= open_tick))
+    {
+        return 0u;
+    }
+
+    *open_ticks = (uint16_t)open_tick;
+    *close_ticks = (uint16_t)close_tick;
+
+    return 1u;
+}
+
+static MOTOR_FAST_CODE uint8_t MOTOR_PrepareBemfPwmGatingTicks(uint16_t duty_ticks)
+{
+    const uint8_t mode = DRIVER_BEMF_PWM_GATING_MODE;
+    uint16_t open_ticks;
+    uint16_t close_ticks;
+    uint8_t active_window;
+    uint8_t alternate_window;
+
+    if (MOTOR_isBemfPwmGatingEnabled() == 0u)
+    {
+        return 0u;
+    }
+
+    active_window = MOTOR_UpdateBemfPwmGatingActiveWindow(duty_ticks);
+
+    if (MOTOR_GetBemfPwmGatingTicksForWindow(active_window,
+                                             duty_ticks,
+                                             &open_ticks,
+                                             &close_ticks) != 0u)
+    {
+        g_motor.bemf_pwm_gating_open_ticks = open_ticks;
+        g_motor.bemf_pwm_gating_close_ticks = close_ticks;
+        return 1u;
+    }
+
+    if (mode != DRIVER_BEMF_PWM_GATING_AUTO)
+    {
+        return 0u;
+    }
+
+    alternate_window =
+        (active_window == MOTOR_BEMF_PWM_SAMPLE_ON_TIME) ?
+        MOTOR_BEMF_PWM_SAMPLE_OFF_TIME : MOTOR_BEMF_PWM_SAMPLE_ON_TIME;
+
+    if (MOTOR_GetBemfPwmGatingTicksForWindow(alternate_window,
+                                             duty_ticks,
+                                             &open_ticks,
+                                             &close_ticks) == 0u)
+    {
+        return 0u;
+    }
+
+    g_motor.bemf_pwm_gating_active_window = alternate_window;
+    g_motor.bemf_pwm_gating_open_ticks = open_ticks;
+    g_motor.bemf_pwm_gating_close_ticks = close_ticks;
+
+    return 1u;
+}
+
+static MOTOR_FAST_CODE uint16_t MOTOR_GetBemfPwmGatingOpenTicks(uint16_t duty_ticks)
+{
+    if (MOTOR_PrepareBemfPwmGatingTicks(duty_ticks) != 0u)
+    {
+        return g_motor.bemf_pwm_gating_open_ticks;
+    }
+
+    return 1u;
+}
+
+static MOTOR_FAST_CODE uint8_t MOTOR_GetBemfExpectedLevelBeforeZc(void)
+{
+    return MOTOR_GetBemfRisingForStep();
+}
+
+static MOTOR_FAST_CODE uint8_t MOTOR_GetBemfExpectedLevelAfterZc(void)
+{
+    if (MOTOR_GetBemfExpectedLevelBeforeZc() == 0u)
     {
         return 1u;
     }
 
-    if (duty_ticks >= (uint16_t)(period_ticks - 1u))
-    {
-        return (uint16_t)(period_ticks - 2u);
-    }
-
-    off_ticks = (uint32_t)period_ticks - duty_ticks;
-    sample_ticks = (uint32_t)duty_ticks +
-                   ((off_ticks * MOTOR_BEMF_PWM_OFF_SAMPLE_PERCENT) / 100u);
-
-    if (sample_ticks >= (uint32_t)(period_ticks - 1u))
-    {
-        sample_ticks = (uint32_t)(period_ticks - 2u);
-    }
-
-    if (sample_ticks == 0u)
-    {
-        sample_ticks = 1u;
-    }
-
-    return (uint16_t)sample_ticks;
+    return 0u;
 }
 
-static MOTOR_FAST_CODE void MOTOR_ServiceBlindSixStepClosedLoopHandoff(void)
+static MOTOR_FAST_CODE uint8_t MOTOR_isBemfPwmSampleZeroCross(uint8_t sampled_level)
 {
-    if (MOTOR_isBlindSixStepTestMode() == 0u)
+    uint16_t interval_ticks;
+    uint16_t min_interval_ticks;
+
+    if (g_motor.bemf_pwm_sample_valid == 0u)
     {
-        return;
+        g_motor.bemf_pwm_last_level = MOTOR_GetBemfExpectedLevelBeforeZc();
+        g_motor.bemf_pwm_sample_valid = 1u;
     }
 
-    if (g_motor.sixstep_closed_loop_handoff_steps == 0u)
+    if (sampled_level == g_motor.bemf_pwm_last_level)
     {
-        return;
+        return 0u;
     }
 
-    g_motor.sixstep_closed_loop_handoff_steps--;
-
-    if (g_motor.sixstep_closed_loop_handoff_steps == 0u)
+    if (sampled_level != MOTOR_GetBemfExpectedLevelAfterZc())
     {
-        MOTOR_UpdateBlindSixStepClosedLoopPwm();
-    }
-}
-
-static MOTOR_FAST_CODE void MOTOR_ServiceBlindSixStepOpenLoopDutyRamp(void)
-{
-    if (MOTOR_isBlindSixStepTestMode() == 0u)
-    {
-        return;
+        return 0u;
     }
 
-    if (g_motor.sixstep_bemf_closed_loop != 0u)
+    interval_ticks = BOARD_GetBemfIntervalTicks();
+    min_interval_ticks = (uint16_t)(g_motor.bemf_average_interval_ticks >> 1u);
+
+    if (interval_ticks <= min_interval_ticks)
     {
-        return;
+        return 0u;
     }
 
-    if ((g_motor.sixstep_phase == MOTOR_SIXSTEP_PHASE_ZERO_ALIGN) ||
-        (g_motor.sixstep_phase == MOTOR_SIXSTEP_PHASE_ZERO_BEMF_WAIT))
-    {
-        return;
-    }
+    g_motor.bemf_pwm_last_level = sampled_level;
+    g_motor.bemf_interval_ticks = interval_ticks;
 
-    if (MOTOR_UpdateBlindSixStepPwm() == 0u)
-    {
-        return;
-    }
-
-    MOTOR_ApplySixStepBridge();
-}
-
-static uint16_t MOTOR_GetSixStepClosedLoopMinPwmTicks(void)
-{
-    return MOTOR_GetPwmTicksFromPermille(DRIVER_SIXSTEP_CLOSED_LOOP_MIN_DUTY_PERMILLE);
+    return 1u;
 }
 
 static void MOTOR_UpdateSinusTiming(int32_t rpm_command)
@@ -761,60 +1321,6 @@ static uint16_t MOTOR_GetSixStepIntervalTicks(int32_t rpm_command)
     }
 
     return (uint16_t)ticks;
-}
-
-static int32_t MOTOR_GetBlindSixStepRampedRpm(void)
-{
-    const uint32_t start_rpm = MOTOR_GetAbsRpm(DRIVER_BLIND_6STEP_START_RPM);
-    const uint32_t target_rpm = MOTOR_GetAbsRpm(DRIVER_BLIND_6STEP_RPM);
-    const uint64_t ramped_delta =
-        ((uint64_t)DRIVER_BLIND_6STEP_RAMP_RPM_PER_SEC * g_motor.sixstep_run_ticks) /
-        DRIVER_CONTROL_LOOP_HZ;
-    uint32_t rpm;
-
-    if (target_rpm <= start_rpm)
-    {
-        return (int32_t)target_rpm;
-    }
-
-    rpm = start_rpm + (uint32_t)ramped_delta;
-
-    if (rpm > target_rpm)
-    {
-        rpm = target_rpm;
-    }
-
-    return (int32_t)rpm;
-}
-
-static MOTOR_FAST_CODE void MOTOR_ServiceBlindSixStepOpenLoopSpeedRamp(void)
-{
-    int32_t next_rpm;
-
-    if (MOTOR_isBlindSixStepTestMode() == 0u)
-    {
-        return;
-    }
-
-    if (g_motor.sixstep_bemf_closed_loop != 0u)
-    {
-        return;
-    }
-
-    if (g_motor.sixstep_phase != MOTOR_SIXSTEP_PHASE_OPEN_LOOP)
-    {
-        return;
-    }
-
-    next_rpm = MOTOR_GetBlindSixStepRampedRpm();
-
-    if (next_rpm == g_motor.ramped_target_rpm)
-    {
-        return;
-    }
-
-    g_motor.ramped_target_rpm = next_rpm;
-    g_motor.sixstep_interval_ticks = MOTOR_GetSixStepIntervalTicks(g_motor.ramped_target_rpm);
 }
 
 static uint16_t MOTOR_GetSixStepBemfIntervalTicks(int32_t rpm_command)
@@ -870,93 +1376,12 @@ static MOTOR_FAST_CODE uint16_t MOTOR_GetControlTicksFromBemfInterval(uint16_t b
     return MOTOR_LimitTickCount(ticks);
 }
 
-static MOTOR_FAST_CODE uint16_t MOTOR_GetBemfFallbackControlTicks(void)
-{
-    if (g_motor.sixstep_fallback_interval_ticks != 0u)
-    {
-        return g_motor.sixstep_fallback_interval_ticks;
-    }
-
-    if (g_motor.bemf_average_interval_ticks != 0u)
-    {
-        return MOTOR_GetControlTicksFromBemfInterval(g_motor.bemf_average_interval_ticks);
-    }
-
-    return MOTOR_GetSixStepIntervalTicks(g_motor.ramped_target_rpm);
-}
-
 static MOTOR_FAST_CODE void MOTOR_UpdateBemfFallbackControlTicks(void)
 {
     const uint16_t interval_ticks =
         MOTOR_GetControlTicksFromBemfInterval(g_motor.bemf_average_interval_ticks);
 
     g_motor.sixstep_fallback_interval_ticks = interval_ticks;
-}
-
-static MOTOR_FAST_CODE uint16_t MOTOR_GetBemfRelockTimeoutTicks(void)
-{
-    const uint32_t sectors =
-        (DRIVER_SIXSTEP_BEMF_RELOCK_LISTEN_SECTORS == 0u) ?
-        1u : DRIVER_SIXSTEP_BEMF_RELOCK_LISTEN_SECTORS;
-    uint32_t min_ticks = DRIVER_SIXSTEP_BEMF_RELOCK_MIN_TIMEOUT_TICKS;
-    uint32_t max_ticks = DRIVER_SIXSTEP_BEMF_RELOCK_MAX_TIMEOUT_TICKS;
-    uint32_t timeout_ticks = g_motor.bemf_average_interval_ticks;
-
-    if (timeout_ticks == 0u)
-    {
-        timeout_ticks = MOTOR_BEMF_START_INTERVAL_TICKS;
-    }
-
-    timeout_ticks *= sectors;
-
-    if (max_ticks < min_ticks)
-    {
-        max_ticks = min_ticks;
-    }
-
-    if (timeout_ticks < min_ticks)
-    {
-        timeout_ticks = min_ticks;
-    }
-
-    if (timeout_ticks > max_ticks)
-    {
-        timeout_ticks = max_ticks;
-    }
-
-    return MOTOR_LimitTickCount(timeout_ticks);
-}
-
-static MOTOR_FAST_CODE void MOTOR_DecayBemfFallbackOpenLoopSpeed(void)
-{
-    uint32_t interval_ticks = g_motor.sixstep_interval_ticks;
-    const uint16_t target_ticks = MOTOR_GetSixStepIntervalTicks(g_motor.ramped_target_rpm);
-
-    if ((interval_ticks == 0u) || (target_ticks == 0u))
-    {
-        return;
-    }
-
-    if (interval_ticks >= target_ticks)
-    {
-        return;
-    }
-
-    interval_ticks = (interval_ticks * MOTOR_BEMF_FALLBACK_DECAY_NUMERATOR) /
-                     MOTOR_BEMF_FALLBACK_DECAY_DENOMINATOR;
-
-    if (interval_ticks <= g_motor.sixstep_interval_ticks)
-    {
-        interval_ticks = (uint32_t)g_motor.sixstep_interval_ticks + 1u;
-    }
-
-    if (interval_ticks > target_ticks)
-    {
-        interval_ticks = target_ticks;
-    }
-
-    g_motor.sixstep_interval_ticks = (uint16_t)interval_ticks;
-    g_motor.sixstep_fallback_interval_ticks = g_motor.sixstep_interval_ticks;
 }
 
 static uint8_t MOTOR_MapFilterLevel(uint16_t interval_ticks)
@@ -1036,11 +1461,6 @@ static void MOTOR_UpdateBemfMeasuredErpm(void)
 
 static MOTOR_FAST_CODE int32_t MOTOR_GetBemfActionAngleOffsetDegX10(void)
 {
-    if (MOTOR_isBlindSixStepTestMode())
-    {
-        return DRIVER_BLIND_6STEP_BEMF_ADVANCE_DEG_X10;
-    }
-
     return g_driver_config.bemf_action_angle_offset_deg_x10;
 }
 
@@ -1109,6 +1529,83 @@ static MOTOR_FAST_CODE void MOTOR_UpdateBemfWaitTime(void)
         MOTOR_GetBemfDelayTicks(g_motor.bemf_average_interval_ticks);
 }
 
+static MOTOR_FAST_CODE int32_t MOTOR_GetBemfPhaseCorrectionTicks(uint16_t captured_interval_ticks)
+{
+    const uint16_t average_interval_ticks = g_motor.bemf_average_interval_ticks;
+    uint8_t phase_shift = DRIVER_SIXSTEP_BEMF_PHASE_SYNC_SHIFT;
+    uint32_t correction_limit_ticks;
+    uint32_t correction_ticks;
+    uint32_t abs_error_ticks;
+    int32_t phase_error_ticks;
+
+    phase_error_ticks = (int32_t)captured_interval_ticks -
+                        (int32_t)average_interval_ticks;
+
+    if (phase_error_ticks == 0)
+    {
+        return 0;
+    }
+
+    if (phase_shift > 15u)
+    {
+        phase_shift = 15u;
+    }
+
+    if (phase_error_ticks < 0)
+    {
+        abs_error_ticks = (uint32_t)(-phase_error_ticks);
+    }
+    else
+    {
+        abs_error_ticks = (uint32_t)phase_error_ticks;
+    }
+
+    correction_ticks = abs_error_ticks >> phase_shift;
+
+    if (DRIVER_SIXSTEP_BEMF_PHASE_SYNC_LIMIT_DIV != 0u)
+    {
+        correction_limit_ticks =
+            ((uint32_t)average_interval_ticks /
+             DRIVER_SIXSTEP_BEMF_PHASE_SYNC_LIMIT_DIV);
+
+        if (correction_limit_ticks == 0u)
+        {
+            correction_limit_ticks = 1u;
+        }
+
+        if (correction_ticks > correction_limit_ticks)
+        {
+            correction_ticks = correction_limit_ticks;
+        }
+    }
+
+    if (phase_error_ticks < 0)
+    {
+        return -(int32_t)correction_ticks;
+    }
+
+    return (int32_t)correction_ticks;
+}
+
+static MOTOR_FAST_CODE uint16_t MOTOR_GetBemfVirtualCommutationDelayTicks(uint16_t captured_interval_ticks)
+{
+    int32_t delay_ticks = (int32_t)MOTOR_GetBemfDelayTicks(g_motor.bemf_average_interval_ticks);
+
+    delay_ticks += MOTOR_GetBemfPhaseCorrectionTicks(captured_interval_ticks);
+
+    if (delay_ticks < 1)
+    {
+        return 1u;
+    }
+
+    if (delay_ticks > 0xFFFF)
+    {
+        return 0xFFFFu;
+    }
+
+    return (uint16_t)delay_ticks;
+}
+
 static MOTOR_FAST_CODE uint16_t MOTOR_GetBemfMissingZcTimeoutTicks(void)
 {
     uint32_t interval_ticks = g_motor.bemf_average_interval_ticks;
@@ -1125,23 +1622,7 @@ static MOTOR_FAST_CODE uint16_t MOTOR_GetBemfMissingZcTimeoutTicks(void)
         delay_ticks = interval_ticks >> 1u;
     }
 
-    if (g_motor.sixstep_missed_zc_blind_steps == 0u)
-    {
-        timeout_ticks = interval_ticks + delay_ticks;
-        return MOTOR_LimitTickCount(timeout_ticks);
-    }
-
-    if (interval_ticks > delay_ticks)
-    {
-        timeout_ticks = interval_ticks - delay_ticks;
-    }
-    else
-    {
-        timeout_ticks = 1u;
-    }
-
-    timeout_ticks = (timeout_ticks *
-                     DRIVER_SIXSTEP_BEMF_MISSED_ZC_NEXT_TIMEOUT_PERCENT) / 100u;
+    timeout_ticks = interval_ticks + delay_ticks;
 
     return MOTOR_LimitTickCount(timeout_ticks);
 }
@@ -1152,11 +1633,13 @@ static MOTOR_FAST_CODE void MOTOR_UpdateBemfDerivedTiming(void)
     int32_t interval_error;
     uint32_t interval_step;
 
+#if DRIVER_SIXSTEP_BEMF_PAIR_AVERAGE_ENABLE
     if (g_motor.bemf_last_zc_ticks != 0u)
     {
         measured_interval = ((uint32_t)g_motor.bemf_last_zc_ticks +
                              g_motor.bemf_this_zc_ticks) >> 1u;
     }
+#endif
 
     if (measured_interval == 0u)
     {
@@ -1278,42 +1761,6 @@ static uint32_t MOTOR_GetSinToSixStepSettleTicks(void)
 }
 #endif
 
-static uint32_t MOTOR_GetSixStepBemfArmDelayTicks(void)
-{
-    const uint64_t ticks = ((uint64_t)DRIVER_SIXSTEP_BEMF_ARM_DELAY_MS *
-                            DRIVER_CONTROL_LOOP_HZ) / 1000u;
-
-    if (ticks == 0u)
-    {
-        return 1u;
-    }
-
-    if (ticks > 0xFFFFFFFFu)
-    {
-        return 0xFFFFFFFFu;
-    }
-
-    return (uint32_t)ticks;
-}
-
-static uint32_t MOTOR_GetSixStepBemfArmMechRevSteps(void)
-{
-    const uint64_t steps = (uint64_t)DRIVER_SIXSTEP_BEMF_ARM_AFTER_MECH_REV *
-                           MOTOR_GetPolePairs() * MOTOR_SIXSTEP_STEP_COUNT;
-
-    if (steps == 0u)
-    {
-        return 0u;
-    }
-
-    if (steps > 0xFFFFFFFFu)
-    {
-        return 0xFFFFFFFFu;
-    }
-
-    return (uint32_t)steps;
-}
-
 static uint32_t MOTOR_GetAlignTicks(void)
 {
     return (DRIVER_OPEN_LOOP_ALIGN_MS * DRIVER_CONTROL_LOOP_HZ) / 1000u;
@@ -1367,39 +1814,6 @@ static uint8_t MOTOR_GetSixStepFromAngle(uint32_t angle_q16)
     return 6u;
 }
 
-static uint8_t MOTOR_GetBlindSixStepStartStep(void)
-{
-    if ((DRIVER_BLIND_6STEP_START_STEP >= 1u) &&
-        (DRIVER_BLIND_6STEP_START_STEP <= MOTOR_SIXSTEP_STEP_COUNT))
-    {
-        return DRIVER_BLIND_6STEP_START_STEP;
-    }
-
-    return 1u;
-}
-
-static uint8_t MOTOR_GetBlindSixStepAlignStep(void)
-{
-    const uint8_t kick_step = MOTOR_GetBlindSixStepStartStep();
-
-    if (g_motor.direction == MOTOR_DIRECTION_CW)
-    {
-        if (kick_step > 1u)
-        {
-            return (uint8_t)(kick_step - 1u);
-        }
-
-        return MOTOR_SIXSTEP_STEP_COUNT;
-    }
-
-    if (kick_step < MOTOR_SIXSTEP_STEP_COUNT)
-    {
-        return (uint8_t)(kick_step + 1u);
-    }
-
-    return 1u;
-}
-
 static void MOTOR_ApplySinusBridge(void)
 {
     const uint32_t full_turn_q16 = DRIVER_SIN_TABLE_STEPS * 65536u;
@@ -1423,6 +1837,7 @@ static void MOTOR_ApplySinusBridge(void)
 static MOTOR_FAST_CODE void MOTOR_ApplySixStepBridge(void)
 {
     const uint16_t duty = g_motor.sixstep_pwm_ticks;
+    uint16_t bemf_pwm_open_ticks;
 
     if ((g_motor.sixstep_step == 0u) ||
         (g_motor.sixstep_step > MOTOR_SIXSTEP_STEP_COUNT))
@@ -1431,144 +1846,11 @@ static MOTOR_FAST_CODE void MOTOR_ApplySixStepBridge(void)
         return;
     }
 
+    bemf_pwm_open_ticks = MOTOR_GetBemfPwmGatingOpenTicks(duty);
+
     BOARD_ApplySixStepBridge(g_motor.sixstep_step,
                              duty,
-                             MOTOR_GetBemfPwmSampleTicks(duty));
-}
-
-static int32_t MOTOR_GetSixStepTargetErpm(void)
-{
-    const uint64_t erpm = (uint64_t)MOTOR_GetAbsRpm(g_motor.ramped_target_rpm) *
-                          MOTOR_GetPolePairs();
-
-    if (erpm > 0x7FFFFFFFu)
-    {
-        return 0x7FFFFFFF;
-    }
-
-    return (int32_t)erpm;
-}
-
-static int32_t MOTOR_GetSixStepInRpmWindowErpm(void)
-{
-    const uint64_t window_erpm = (uint64_t)g_driver_config.in_rpm_window *
-                                 MOTOR_GetPolePairs();
-
-    if (window_erpm > 0x7FFFFFFFu)
-    {
-        return 0x7FFFFFFF;
-    }
-
-    return (int32_t)window_erpm;
-}
-
-static int32_t MOTOR_GetSixStepDutyDeltaTicks(int32_t error_erpm)
-{
-    const int32_t erpm_per_pwm_tick =
-        (DRIVER_SIXSTEP_SPEED_KP_ERPM_PER_PWM_TICK == 0u) ?
-        1 : (int32_t)DRIVER_SIXSTEP_SPEED_KP_ERPM_PER_PWM_TICK;
-    const int32_t max_step =
-        (DRIVER_SIXSTEP_SPEED_MAX_STEP_TICKS == 0u) ?
-        1 : (int32_t)DRIVER_SIXSTEP_SPEED_MAX_STEP_TICKS;
-    int64_t abs_error = error_erpm;
-    int32_t delta;
-
-    if (error_erpm == 0)
-    {
-        return 0;
-    }
-
-    if (abs_error < 0)
-    {
-        abs_error = -abs_error;
-    }
-
-    delta = (int32_t)(abs_error / erpm_per_pwm_tick);
-
-    if (delta == 0)
-    {
-        delta = 1;
-    }
-
-    if (delta > max_step)
-    {
-        delta = max_step;
-    }
-
-    if (error_erpm < 0)
-    {
-        delta = -delta;
-    }
-
-    return delta;
-}
-
-static void MOTOR_UpdateSixStepClosedLoopDuty(void)
-{
-    const uint16_t divider =
-        (DRIVER_SIXSTEP_SPEED_CONTROL_DIVIDER_TICKS == 0u) ?
-        1u : DRIVER_SIXSTEP_SPEED_CONTROL_DIVIDER_TICKS;
-    const int32_t target_erpm = MOTOR_GetSixStepTargetErpm();
-    const int32_t measured_erpm = g_motor.measured_erpm;
-    const int32_t error_erpm = target_erpm - measured_erpm;
-    const int32_t rpm_window_erpm = MOTOR_GetSixStepInRpmWindowErpm();
-    int32_t next_pwm_ticks;
-    int32_t min_pwm_ticks;
-    int32_t max_pwm_ticks;
-
-    if (MOTOR_isBlindSixStepTestMode())
-    {
-        g_motor.in_rpm = 1u;
-        return;
-    }
-
-    if (g_motor.sixstep_speed_control_tick < 0xFFFFu)
-    {
-        g_motor.sixstep_speed_control_tick++;
-    }
-
-    if (g_motor.sixstep_speed_control_tick < divider)
-    {
-        return;
-    }
-
-    g_motor.sixstep_speed_control_tick = 0u;
-
-    if ((error_erpm >= -rpm_window_erpm) && (error_erpm <= rpm_window_erpm))
-    {
-        g_motor.in_rpm = 1u;
-        return;
-    }
-
-    g_motor.in_rpm = 0u;
-    min_pwm_ticks = MOTOR_GetSixStepClosedLoopMinPwmTicks();
-    max_pwm_ticks = g_motor.sixstep_pwm_limit_ticks;
-
-    if (min_pwm_ticks > max_pwm_ticks)
-    {
-        min_pwm_ticks = max_pwm_ticks;
-    }
-
-    next_pwm_ticks = (int32_t)g_motor.sixstep_pwm_ticks +
-                     MOTOR_GetSixStepDutyDeltaTicks(error_erpm);
-
-    if (next_pwm_ticks > max_pwm_ticks)
-    {
-        next_pwm_ticks = max_pwm_ticks;
-    }
-
-    if (next_pwm_ticks < min_pwm_ticks)
-    {
-        next_pwm_ticks = min_pwm_ticks;
-    }
-
-    if (g_motor.sixstep_pwm_ticks == (uint16_t)next_pwm_ticks)
-    {
-        return;
-    }
-
-    g_motor.sixstep_pwm_ticks = (uint16_t)next_pwm_ticks;
-    MOTOR_ApplySixStepBridge();
+                             bemf_pwm_open_ticks);
 }
 
 static void MOTOR_AdvanceSinusAngle(void)
@@ -1641,148 +1923,6 @@ static MOTOR_FAST_CODE uint8_t MOTOR_GetBemfInputStepForPwmStep(uint8_t pwm_step
     return input_step;
 }
 
-static MOTOR_FAST_CODE uint8_t MOTOR_GetBemfPhaseMaskForInputStep(uint8_t input_step)
-{
-    if ((input_step == 1u) || (input_step == 4u))
-    {
-        return MOTOR_BEMF_PHASE_C_MASK;
-    }
-
-    if ((input_step == 2u) || (input_step == 5u))
-    {
-        return MOTOR_BEMF_PHASE_A_MASK;
-    }
-
-    return MOTOR_BEMF_PHASE_B_MASK;
-}
-
-static void MOTOR_SelectBemfDiagnosticPhase(uint8_t phase)
-{
-    BEMF_AM32_MaskPhaseInterrupts();
-
-    if (phase == MOTOR_BEMF_LED_PHASE_A)
-    {
-        BEMF_AM32_ChangeCompInput(2u, 0u);
-        return;
-    }
-
-    if (phase == MOTOR_BEMF_LED_PHASE_B)
-    {
-        BEMF_AM32_ChangeCompInput(3u, 0u);
-        return;
-    }
-
-    BEMF_AM32_ChangeCompInput(1u, 0u);
-}
-
-static uint8_t MOTOR_GetNextBemfDiagnosticPhase(uint8_t phase)
-{
-    if (phase == MOTOR_BEMF_LED_PHASE_A)
-    {
-        return MOTOR_BEMF_LED_PHASE_B;
-    }
-
-    if (phase == MOTOR_BEMF_LED_PHASE_B)
-    {
-        return MOTOR_BEMF_LED_PHASE_C;
-    }
-
-    return MOTOR_BEMF_LED_PHASE_A;
-}
-
-static void MOTOR_RecordBemfDiagnosticLevel(uint8_t phase, uint8_t level)
-{
-    volatile uint8_t *stored_level;
-
-    if (phase == MOTOR_BEMF_LED_PHASE_A)
-    {
-        stored_level = &g_motor.bemf_diag_level_a;
-    }
-    else if (phase == MOTOR_BEMF_LED_PHASE_B)
-    {
-        stored_level = &g_motor.bemf_diag_level_b;
-    }
-    else
-    {
-        stored_level = &g_motor.bemf_diag_level_c;
-    }
-
-    if (g_motor.bemf_diag_initialized == 0u)
-    {
-        *stored_level = level;
-        g_motor.bemf_diag_initialized = 1u;
-        return;
-    }
-
-    if (*stored_level == level)
-    {
-        return;
-    }
-
-    *stored_level = level;
-    g_motor.bemf_led_phase = phase;
-    g_motor.bemf_readable = 1u;
-    g_motor.bemf_diag_phase = MOTOR_GetNextBemfDiagnosticPhase(phase);
-    g_motor.bemf_diag_initialized = 0u;
-    MOTOR_SelectBemfDiagnosticPhase(g_motor.bemf_diag_phase);
-}
-
-static void MOTOR_BemfLedDiagnosticTick(void)
-{
-    const uint8_t sampled_phase = g_motor.bemf_diag_phase;
-    const uint8_t level = BEMF_AM32_GetOutputLevel();
-
-    MOTOR_RecordBemfDiagnosticLevel(sampled_phase, level);
-
-    BOARD_AllPhasesOff();
-}
-
-static void MOTOR_StartBemfLedDiagnostic(void)
-{
-    g_motor.mode = MOTOR_MODE_STOP;
-    g_motor.bemf_readable = 0u;
-    g_motor.bemf_armed = 0u;
-    g_motor.bemf_led_phase = MOTOR_BEMF_LED_PHASE_NONE;
-    g_motor.bemf_led_phase_mask = 0u;
-    g_motor.bemf_led_hold_ticks = 0u;
-    g_motor.bemf_diag_phase = MOTOR_BEMF_LED_PHASE_A;
-    g_motor.bemf_diag_initialized = 0u;
-    g_motor.bemf_diag_level_a = 0u;
-    g_motor.bemf_diag_level_b = 0u;
-    g_motor.bemf_diag_level_c = 0u;
-
-    BOARD_DisableBemfCommutationTimer();
-    BOARD_AllPhasesOff();
-    BEMF_AM32_MaskPhaseInterrupts();
-    BEMF_AM32_SetFilterLevel(1u);
-    MOTOR_SelectBemfDiagnosticPhase(g_motor.bemf_diag_phase);
-}
-
-static uint8_t MOTOR_isBemfArmAllowed(void)
-{
-    if (g_motor.sixstep_phase == MOTOR_SIXSTEP_PHASE_ZERO_BEMF_WAIT)
-    {
-        return 1u;
-    }
-
-    if (g_motor.sixstep_run_ticks < MOTOR_GetSixStepBemfArmDelayTicks())
-    {
-        return 0u;
-    }
-
-    if (g_motor.sixstep_commutation_count < DRIVER_SIXSTEP_BEMF_ARM_AFTER_STEPS)
-    {
-        return 0u;
-    }
-
-    if (g_motor.sixstep_commutation_count < MOTOR_GetSixStepBemfArmMechRevSteps())
-    {
-        return 0u;
-    }
-
-    return 1u;
-}
-
 static MOTOR_FAST_CODE uint8_t MOTOR_isBemfArmed(void)
 {
     if (g_motor.bemf_armed != 0u)
@@ -1797,10 +1937,10 @@ static void MOTOR_ResetBemfValidation(void)
 {
     g_motor.bemf_zero_cross_count = 0u;
     g_motor.bemf_readable = 0u;
-    g_motor.bemf_phase_mask = 0u;
-    g_motor.bemf_led_phase_mask = 0u;
     g_motor.bemf_poll_count = 0u;
     g_motor.bemf_slow_update_tick = 0u;
+    g_motor.sixstep_missed_zc_count = 0u;
+    g_motor.sixstep_virtual_zc_pending = 0u;
 }
 
 static MOTOR_FAST_CODE uint8_t MOTOR_GetBemfBlankTicks(void)
@@ -1822,140 +1962,50 @@ static MOTOR_FAST_CODE uint8_t MOTOR_GetBemfBlankTicks(void)
     return blank_ticks;
 }
 
-static void MOTOR_ResetBemfLock(void)
+static MOTOR_FAST_CODE void MOTOR_RunVirtualBemfCommutation(void)
 {
-    MOTOR_ResetBemfValidation();
-    g_motor.sixstep_bemf_closed_loop = 0u;
+    if (g_motor.sixstep_missed_zc_count < 0xFFu)
+    {
+        g_motor.sixstep_missed_zc_count++;
+    }
+
     g_motor.sixstep_commutation_pending = 0u;
-    g_motor.sixstep_closed_loop_handoff_steps = 0u;
-    g_motor.sixstep_phase = MOTOR_SIXSTEP_PHASE_OPEN_LOOP;
-    g_motor.sixstep_interval_ticks = MOTOR_GetBemfFallbackControlTicks();
     g_motor.sixstep_tick = 0u;
-    g_motor.sixstep_speed_control_tick = 0u;
-    g_motor.sixstep_relock_scan_steps = 0u;
-    g_motor.sixstep_missed_zc_blind_steps = 0u;
-    g_motor.bemf_armed = 0u;
-
-    g_motor.sixstep_pwm_ticks = g_motor.sixstep_pwm_limit_ticks;
-
-    g_motor.sixstep_bemf_delay_ticks = 0u;
-
-    if (g_motor.sixstep_fallback_interval_ticks != 0u)
-    {
-        MOTOR_UpdateAdaptiveSixStepPwmCarrier();
-    }
-    else
-    {
-        MOTOR_RestoreDefaultPwmCarrier();
-    }
-
-    BOARD_EnableBemfPwmSampleIrq(0u);
-    BOARD_DisableBemfCommutationTimer();
-}
-
-static MOTOR_FAST_CODE void MOTOR_ArmBemfCoastWaitStep(void)
-{
-    BOARD_AllPhasesOff();
     g_motor.bemf_edge_seen = 1u;
-    g_motor.bemf_blank_ticks = 0u;
-    MOTOR_ArmBemfForSixStep();
-
-    if (MOTOR_isBemfArmed() != 0u)
-    {
-        g_motor.sixstep_phase = MOTOR_SIXSTEP_PHASE_BEMF_COAST_WAIT;
-        g_motor.bemf_interval_ticks = 0u;
-        BOARD_ResetBemfIntervalTimer();
-    }
-}
-
-static MOTOR_FAST_CODE void MOTOR_FallbackBemfCoastWaitToOpenLoop(void)
-{
-    g_motor.sixstep_handoff_coast_done = 0u;
-    g_motor.sixstep_relock_scan_steps = 0u;
-    MOTOR_ResetBemfLock();
-    g_motor.sixstep_handoff_coast_done = 0u;
-    g_motor.bemf_edge_seen = 1u;
-    MOTOR_ApplySixStepBridge();
-    MOTOR_ArmBemfForSixStep();
-}
-
-static MOTOR_FAST_CODE void MOTOR_ScanNextBemfCoastWaitStep(void)
-{
-    if (g_motor.sixstep_relock_scan_steps >= MOTOR_BEMF_RELOCK_SCAN_STEP_LIMIT)
-    {
-        MOTOR_FallbackBemfCoastWaitToOpenLoop();
-        return;
-    }
-
-    g_motor.sixstep_relock_scan_steps++;
-    MOTOR_AdvanceSixStepStepIndex();
-    MOTOR_ResetBemfValidation();
-    g_motor.bemf_last_zc_ticks = 0u;
-    g_motor.bemf_this_zc_ticks = 0u;
-    g_motor.sixstep_phase = MOTOR_SIXSTEP_PHASE_BEMF_COAST_WAIT;
-    MOTOR_ArmBemfCoastWaitStep();
-}
-
-static MOTOR_FAST_CODE void MOTOR_StartBemfRelockCoast(void)
-{
-    MOTOR_ResetBemfValidation();
-    g_motor.sixstep_bemf_closed_loop = 0u;
-    g_motor.sixstep_commutation_pending = 0u;
-    g_motor.sixstep_closed_loop_handoff_steps = 0u;
-    g_motor.sixstep_phase = MOTOR_SIXSTEP_PHASE_BEMF_COAST_WAIT;
-    g_motor.sixstep_interval_ticks = MOTOR_GetBemfFallbackControlTicks();
-    g_motor.sixstep_tick = 0u;
-    g_motor.sixstep_speed_control_tick = 0u;
-    g_motor.sixstep_relock_scan_steps = 0u;
-    g_motor.sixstep_missed_zc_blind_steps = 0u;
-    g_motor.bemf_armed = 0u;
-    g_motor.bemf_edge_seen = 1u;
-    g_motor.bemf_blank_ticks = 0u;
-    g_motor.sixstep_pwm_ticks = g_motor.sixstep_pwm_limit_ticks;
-
-    BEMF_AM32_MaskPhaseInterrupts();
-    BOARD_EnableBemfPwmSampleIrq(0u);
-    BOARD_DisableBemfCommutationTimer();
-    MOTOR_ArmBemfCoastWaitStep();
-}
-
-static MOTOR_FAST_CODE void MOTOR_StartBemfHandoffCoast(void)
-{
-    g_motor.sixstep_handoff_coast_done = 1u;
-    MOTOR_StartBemfRelockCoast();
-}
-
-static MOTOR_FAST_CODE uint8_t MOTOR_ServiceBemfCoastWait(void)
-{
-    if (g_motor.sixstep_phase != MOTOR_SIXSTEP_PHASE_BEMF_COAST_WAIT)
-    {
-        return 0u;
-    }
-
-    if (g_motor.bemf_interval_ticks > MOTOR_GetBemfRelockTimeoutTicks())
-    {
-        MOTOR_ScanNextBemfCoastWaitStep();
-    }
-
-    return 1u;
-}
-
-static MOTOR_FAST_CODE void MOTOR_StartBemfMissedZcBlindStep(void)
-{
-    if (g_motor.sixstep_missed_zc_blind_steps < 0xFFu)
-    {
-        g_motor.sixstep_missed_zc_blind_steps++;
-    }
-
-    g_motor.sixstep_commutation_pending = 0u;
-    g_motor.bemf_edge_seen = 1u;
-    g_motor.bemf_last_zc_ticks = 0u;
-    g_motor.bemf_this_zc_ticks = 0u;
+    g_motor.bemf_last_zc_ticks = g_motor.bemf_this_zc_ticks;
+    g_motor.bemf_this_zc_ticks = g_motor.bemf_average_interval_ticks;
     g_motor.bemf_interval_ticks = 0u;
+    g_motor.sixstep_virtual_zc_pending = 1u;
 
     BOARD_DisableBemfCommutationTimer();
     BOARD_ResetBemfIntervalTimer();
     MOTOR_AdvanceSixStepStep();
+}
+
+static MOTOR_FAST_CODE void MOTOR_StartBemfRecoveryOff(void)
+{
+    MOTOR_ResetBemfValidation();
+    g_motor.sixstep_bemf_closed_loop = 0u;
+    g_motor.sixstep_phase = MOTOR_SIXSTEP_PHASE_RECOVERY_OFF;
+    g_motor.sixstep_recovery_off_tick = 0u;
+    g_motor.sixstep_missed_zc_count = 0u;
+    g_motor.sixstep_virtual_zc_pending = 0u;
+    g_motor.sixstep_commutation_pending = 0u;
+    g_motor.bemf_edge_seen = 1u;
+    g_motor.bemf_armed = 0u;
+    g_motor.bemf_blank_ticks = 0u;
+    g_motor.bemf_interval_ticks = 0u;
+    g_motor.bemf_pwm_gating_open_ticks = 0u;
+    g_motor.bemf_pwm_gating_close_ticks = 0u;
+    g_motor.bemf_pwm_gating_close_pending = 0u;
+    g_motor.bemf_pwm_sample_valid = 0u;
+    g_motor.bemf_pwm_last_level = 0u;
+
+    BEMF_AM32_MaskPhaseInterrupts();
+    MOTOR_StopBemfPwmGating();
+    BOARD_DisableBemfCommutationTimer();
+    BOARD_ResetBemfIntervalTimer();
+    BOARD_AllPhasesOff();
 }
 
 static MOTOR_FAST_CODE uint8_t MOTOR_ServiceBemfMissingZcClosedLoop(void)
@@ -1971,26 +2021,95 @@ static MOTOR_FAST_CODE uint8_t MOTOR_ServiceBemfMissingZcClosedLoop(void)
         return 0u;
     }
 
-    if (g_motor.sixstep_missed_zc_blind_steps <
-        DRIVER_SIXSTEP_BEMF_MISSED_ZC_BLIND_STEPS)
+    if (g_motor.sixstep_missed_zc_count <
+        DRIVER_SIXSTEP_BEMF_MISSING_ZC_VIRTUAL_STEPS)
     {
-        MOTOR_StartBemfMissedZcBlindStep();
+        MOTOR_RunVirtualBemfCommutation();
         return 1u;
     }
 
-    g_motor.sixstep_missed_zc_blind_steps = 0u;
-    MOTOR_StartBemfRelockCoast();
+    MOTOR_StartBemfRecoveryOff();
+    return 1u;
+}
+
+static MOTOR_FAST_CODE void MOTOR_RestartSixStepHandoffAfterRecovery(void)
+{
+    uint16_t interval_ticks = g_motor.sixstep_fallback_interval_ticks;
+
+    if (interval_ticks == 0u)
+    {
+        interval_ticks = MOTOR_GetControlTicksFromBemfInterval(g_motor.bemf_average_interval_ticks);
+    }
+
+    if (interval_ticks == 0u)
+    {
+        interval_ticks = MOTOR_GetSixStepIntervalTicks(g_motor.ramped_target_rpm);
+    }
+
+    g_motor.sixstep_bemf_closed_loop = 0u;
+    g_motor.sixstep_phase = MOTOR_SIXSTEP_PHASE_SIN_HANDOFF;
+    g_motor.sixstep_interval_ticks = interval_ticks;
+    g_motor.sixstep_fallback_interval_ticks = interval_ticks;
+    g_motor.sixstep_tick = 0u;
+    g_motor.sixstep_commutation_pending = 0u;
+    g_motor.sixstep_missed_zc_count = 0u;
+    g_motor.sixstep_recovery_off_tick = 0u;
+    g_motor.sixstep_virtual_zc_pending = 0u;
+    g_motor.bemf_edge_seen = 1u;
+    g_motor.bemf_armed = 0u;
+    g_motor.bemf_last_zc_ticks = 0u;
+    g_motor.bemf_this_zc_ticks = 0u;
+    g_motor.bemf_interval_ticks = 0u;
+    g_motor.bemf_pwm_gating_open_ticks = 0u;
+    g_motor.bemf_pwm_gating_close_ticks = 0u;
+    g_motor.bemf_pwm_gating_close_pending = 0u;
+    g_motor.bemf_pwm_sample_valid = 0u;
+    g_motor.bemf_pwm_last_level = 0u;
+    g_motor.bemf_zero_cross_count = 0u;
+    g_motor.bemf_readable = 0u;
+
+    g_motor.sixstep_pwm_ticks =
+        MOTOR_GetSixStepPwmTicksFromPermille(MOTOR_GetSixStepStartDutyPermille());
+    MOTOR_UpdateBemfWaitTime();
+    MOTOR_UpdateBemfFilterLevel();
+    BOARD_ResetBemfIntervalTimer();
+    MOTOR_ApplySixStepBridge();
+    MOTOR_ArmBemfForSixStep();
+}
+
+static MOTOR_FAST_CODE uint8_t MOTOR_ServiceBemfRecoveryOff(void)
+{
+    uint16_t recovery_ticks = DRIVER_SIXSTEP_BEMF_RECOVERY_OFF_TICKS;
+
+    if (g_motor.sixstep_phase != MOTOR_SIXSTEP_PHASE_RECOVERY_OFF)
+    {
+        return 0u;
+    }
+
+    if (recovery_ticks == 0u)
+    {
+        recovery_ticks = 1u;
+    }
+
+    if (g_motor.sixstep_recovery_off_tick < 0xFFFFu)
+    {
+        g_motor.sixstep_recovery_off_tick++;
+    }
+
+    if (g_motor.sixstep_recovery_off_tick < recovery_ticks)
+    {
+        return 1u;
+    }
+
+    MOTOR_RestartSixStepHandoffAfterRecovery();
 
     return 1u;
 }
 
 static MOTOR_FAST_CODE void MOTOR_ArmBemfForSixStep(void)
 {
-    const uint8_t zero_start_wait =
-        (g_motor.sixstep_phase == MOTOR_SIXSTEP_PHASE_ZERO_BEMF_WAIT) ? 1u : 0u;
-
     BEMF_AM32_MaskPhaseInterrupts();
-    BOARD_EnableBemfPwmSampleIrq(0u);
+    MOTOR_StopBemfPwmGating();
 
     if (g_motor.bemf_average_interval_ticks == 0u)
     {
@@ -2005,51 +2124,33 @@ static MOTOR_FAST_CODE void MOTOR_ArmBemfForSixStep(void)
     BEMF_AM32_ChangeCompInput(MOTOR_GetBemfInputStepForPwmStep(g_motor.sixstep_step),
                               MOTOR_GetBemfRisingForStep());
 
-    if (MOTOR_isBemfArmAllowed() == 0u)
-    {
-        g_motor.bemf_armed = 0u;
-        g_motor.bemf_edge_seen = 1u;
-        g_motor.bemf_blank_ticks = 0u;
-        MOTOR_ResetBemfLock();
-        return;
-    }
-
     if (MOTOR_isBemfArmed() == 0u)
     {
         g_motor.bemf_armed = 1u;
-
-        if (zero_start_wait == 0u)
-        {
-            g_motor.sixstep_phase = MOTOR_SIXSTEP_PHASE_BEMF_ACQUIRE;
-        }
-
         g_motor.bemf_edge_seen = 1u;
         g_motor.bemf_last_zc_ticks = g_motor.bemf_average_interval_ticks;
         g_motor.bemf_this_zc_ticks = g_motor.bemf_average_interval_ticks;
         g_motor.bemf_interval_ticks = g_motor.bemf_average_interval_ticks;
         BOARD_SetBemfIntervalTicks(g_motor.bemf_average_interval_ticks >> 1u);
         MOTOR_ResetBemfValidation();
-
     }
 
     if (g_motor.bemf_edge_seen == 0u)
     {
-        MOTOR_StartBemfRelockCoast();
-        return;
+        MOTOR_ResetBemfValidation();
+        g_motor.bemf_edge_seen = 1u;
     }
 
     g_motor.bemf_edge_seen = 0u;
     g_motor.bemf_poll_count = 0u;
     g_motor.bemf_blank_ticks = MOTOR_GetBemfBlankTicks();
 
-    if ((g_motor.bemf_blank_ticks == 0u) &&
-        (MOTOR_isBemfPwmGatedMode() != 0u))
+    if (g_motor.bemf_blank_ticks == 0u)
     {
-        BOARD_EnableBemfPwmSampleIrq(1u);
-    }
-    else if (g_motor.bemf_blank_ticks == 0u)
-    {
-        BEMF_AM32_EnableCompInterrupts();
+        if (MOTOR_StartBemfPwmGating() == 0u)
+        {
+            BEMF_AM32_EnableCompInterrupts();
+        }
     }
 }
 
@@ -2064,11 +2165,7 @@ static MOTOR_FAST_CODE void MOTOR_ServiceBemfBlank(void)
 
     if (g_motor.bemf_blank_ticks == 0u)
     {
-        if (MOTOR_isBemfPwmGatedMode() != 0u)
-        {
-            BOARD_EnableBemfPwmSampleIrq(1u);
-        }
-        else
+        if (MOTOR_StartBemfPwmGating() == 0u)
         {
             BEMF_AM32_EnableCompInterrupts();
         }
@@ -2116,7 +2213,6 @@ static MOTOR_FAST_CODE void MOTOR_CommitBemfCommutation(void)
     g_motor.sixstep_commutation_pending = 0u;
     g_motor.sixstep_tick = 0u;
     MOTOR_AdvanceSixStepStep();
-    MOTOR_ServiceBlindSixStepClosedLoopHandoff();
 }
 
 static void MOTOR_EnterSixStepFromSinus(void)
@@ -2127,201 +2223,50 @@ static void MOTOR_EnterSixStepFromSinus(void)
     g_motor.mode = MOTOR_MODE_SIXSTEP;
     g_motor.sixstep_step = MOTOR_GetSixStepFromAngle(g_motor.sinus_angle_q16);
     g_motor.sixstep_tick = 0u;
-    g_motor.sixstep_speed_control_tick = 0u;
     g_motor.sixstep_bemf_delay_ticks = 0u;
     g_motor.sixstep_run_ticks = 0u;
     g_motor.sixstep_commutation_count = 0u;
     g_motor.sixstep_interval_ticks = MOTOR_GetSixStepIntervalTicks(g_motor.ramped_target_rpm);
     g_motor.sixstep_fallback_interval_ticks = g_motor.sixstep_interval_ticks;
-    g_motor.sixstep_relock_scan_steps = 0u;
-    g_motor.sixstep_missed_zc_blind_steps = 0u;
+    g_motor.sixstep_missed_zc_count = 0u;
+    g_motor.sixstep_recovery_off_tick = 0u;
+    g_motor.sixstep_virtual_zc_pending = 0u;
     g_motor.bemf_interval_ticks = 0u;
     g_motor.bemf_average_interval_ticks =
         MOTOR_GetBemfInitialIntervalTicks(MOTOR_GetSixStepBemfIntervalTicks(g_motor.ramped_target_rpm));
     g_motor.bemf_last_zc_ticks = g_motor.bemf_average_interval_ticks;
     g_motor.bemf_this_zc_ticks = g_motor.bemf_average_interval_ticks;
+    g_motor.bemf_pwm_gating_open_ticks = 0u;
+    g_motor.bemf_pwm_gating_close_ticks = 0u;
     g_motor.bemf_blank_ticks = 0u;
     g_motor.bemf_poll_count = 0u;
     g_motor.bemf_zero_cross_count = 0u;
     g_motor.bemf_slow_update_tick = 0u;
     g_motor.bemf_edge_seen = 1u;
     g_motor.bemf_armed = 0u;
+    g_motor.bemf_pwm_gating_active_window = MOTOR_BEMF_PWM_SAMPLE_OFF_TIME;
+    g_motor.bemf_pwm_gating_close_pending = 0u;
+    g_motor.bemf_pwm_sample_valid = 0u;
+    g_motor.bemf_pwm_last_level = 0u;
     g_motor.bemf_readable = 0u;
-    g_motor.bemf_phase_mask = 0u;
-    g_motor.bemf_led_phase_mask = 0u;
     g_motor.sixstep_bemf_closed_loop = 0u;
+    g_motor.hard_current_fault = 0u;
     g_motor.sixstep_commutation_pending = 0u;
-    g_motor.sixstep_closed_loop_handoff_steps = 0u;
-    g_motor.sixstep_phase = MOTOR_SIXSTEP_PHASE_OPEN_LOOP;
-    g_motor.sixstep_handoff_coast_done = 0u;
+    g_motor.sixstep_phase = MOTOR_SIXSTEP_PHASE_SIN_HANDOFF;
 
     MOTOR_UpdateBemfWaitTime();
     MOTOR_UpdateBemfMeasuredErpm();
     MOTOR_UpdateBemfFilterLevel();
     BOARD_DisableBemfCommutationTimer();
 
-    g_motor.sixstep_pwm_ticks = g_motor.sinus_pwm_ticks;
-
-    if (g_motor.sixstep_pwm_ticks > g_motor.sixstep_pwm_limit_ticks)
-    {
-        g_motor.sixstep_pwm_ticks = g_motor.sixstep_pwm_limit_ticks;
-    }
+    g_motor.sixstep_pwm_ticks = MOTOR_GetSinToSixStepPwmTicks();
 
     MOTOR_ApplySixStepBridge();
     MOTOR_ArmBemfForSixStep();
-}
-
-static MOTOR_FAST_CODE void MOTOR_StartBlindSixStepOpenLoopRamp(void)
-{
-    g_motor.sixstep_phase = MOTOR_SIXSTEP_PHASE_OPEN_LOOP;
-    g_motor.sixstep_run_ticks = 0u;
-    g_motor.sixstep_tick = 0u;
-    g_motor.ramped_target_rpm = DRIVER_BLIND_6STEP_START_RPM;
-    g_motor.measured_erpm = g_motor.ramped_target_rpm * (int32_t)MOTOR_GetPolePairs();
-    g_motor.sixstep_interval_ticks = MOTOR_GetSixStepIntervalTicks(g_motor.ramped_target_rpm);
-    g_motor.sixstep_fallback_interval_ticks = g_motor.sixstep_interval_ticks;
-    g_motor.bemf_average_interval_ticks =
-        MOTOR_GetBemfInitialIntervalTicks(MOTOR_GetSixStepBemfIntervalTicks(g_motor.ramped_target_rpm));
-    g_motor.bemf_last_zc_ticks = g_motor.bemf_average_interval_ticks;
-    g_motor.bemf_this_zc_ticks = g_motor.bemf_average_interval_ticks;
-    g_motor.bemf_edge_seen = 1u;
-    g_motor.bemf_armed = 0u;
-    g_motor.bemf_blank_ticks = 0u;
-    g_motor.sixstep_missed_zc_blind_steps = 0u;
-
-    (void)MOTOR_UpdateBlindSixStepPwm();
-    MOTOR_UpdateBemfWaitTime();
-    MOTOR_UpdateBemfMeasuredErpm();
-    MOTOR_UpdateBemfFilterLevel();
-    BOARD_SetBemfIntervalTicks(MOTOR_BEMF_START_COUNTER_TICKS);
-    BEMF_AM32_MaskPhaseInterrupts();
-    MOTOR_ApplySixStepBridge();
-}
-
-static MOTOR_FAST_CODE void MOTOR_StartBlindSixStepZeroBemfWait(void)
-{
-    g_motor.sixstep_phase = MOTOR_SIXSTEP_PHASE_ZERO_BEMF_WAIT;
-    g_motor.sixstep_run_ticks = 0u;
-    g_motor.sixstep_tick = 0u;
-    g_motor.sixstep_step = MOTOR_GetBlindSixStepStartStep();
-    g_motor.ramped_target_rpm = 0;
-    g_motor.measured_erpm = 0;
-    g_motor.bemf_average_interval_ticks = 1u;
-    g_motor.bemf_last_zc_ticks = 0u;
-    g_motor.bemf_this_zc_ticks = 0u;
-    g_motor.bemf_interval_ticks = 0u;
-    g_motor.bemf_edge_seen = 1u;
-    g_motor.bemf_armed = 0u;
-    g_motor.bemf_blank_ticks = 0u;
-    g_motor.bemf_zero_cross_count = 0u;
-    g_motor.bemf_phase_mask = 0u;
-    g_motor.sixstep_missed_zc_blind_steps = 0u;
-
-    (void)MOTOR_UpdateBlindSixStepPwm();
-    MOTOR_UpdateBemfWaitTime();
-    MOTOR_UpdateBemfMeasuredErpm();
-    MOTOR_UpdateBemfFilterLevel();
-    BOARD_ResetBemfIntervalTimer();
-    BEMF_AM32_MaskPhaseInterrupts();
-    MOTOR_ApplySixStepBridge();
-    MOTOR_ArmBemfForSixStep();
-}
-
-static MOTOR_FAST_CODE uint8_t MOTOR_ServiceBlindSixStepZeroStart(void)
-{
-    if (g_motor.sixstep_phase == MOTOR_SIXSTEP_PHASE_ZERO_ALIGN)
-    {
-        if (g_motor.sixstep_run_ticks < 0xFFFFFFFFu)
-        {
-            g_motor.sixstep_run_ticks++;
-        }
-
-        if (g_motor.sixstep_run_ticks >= MOTOR_GetBlindSixStepAlignTicks())
-        {
-            MOTOR_StartBlindSixStepZeroBemfWait();
-        }
-
-        return 1u;
-    }
-
-    if (g_motor.sixstep_phase != MOTOR_SIXSTEP_PHASE_ZERO_BEMF_WAIT)
-    {
-        return 0u;
-    }
-
-    if (g_motor.sixstep_run_ticks < 0xFFFFFFFFu)
-    {
-        g_motor.sixstep_run_ticks++;
-    }
-
-    if (g_motor.sixstep_run_ticks >= MOTOR_GetBlindSixStepZeroBemfTimeoutTicks())
-    {
-        MOTOR_StartBlindSixStepOpenLoopRamp();
-    }
-
-    return 1u;
-}
-
-static void MOTOR_StartBlindSixStepTest(void)
-{
-    MOTOR_RestoreDefaultPwmCarrier();
-    g_motor.mode = MOTOR_MODE_SIXSTEP;
-    g_motor.direction = DRIVER_OPEN_LOOP_DIRECTION;
-    g_motor.target_rpm = DRIVER_BLIND_6STEP_RPM;
-    g_motor.ramped_target_rpm = 0;
-    g_motor.measured_erpm = 0;
-    g_motor.sinus_angle_q16 = 0u;
-    g_motor.sinus_step_q16 = 0u;
-    g_motor.open_loop_tick = 0u;
-    g_motor.sinus_at_target_ticks = 0u;
-    g_motor.sixstep_run_ticks = 0u;
-    g_motor.sixstep_commutation_count = 0u;
-    g_motor.sixstep_step = MOTOR_GetBlindSixStepAlignStep();
-    g_motor.sixstep_tick = 0u;
-    g_motor.sixstep_speed_control_tick = 0u;
-    g_motor.sixstep_bemf_delay_ticks = 0u;
-    g_motor.sixstep_interval_ticks = MOTOR_GetSixStepIntervalTicks(DRIVER_BLIND_6STEP_START_RPM);
-    g_motor.sixstep_fallback_interval_ticks = g_motor.sixstep_interval_ticks;
-    g_motor.sixstep_relock_scan_steps = 0u;
-    g_motor.sixstep_missed_zc_blind_steps = 0u;
-    g_motor.bemf_interval_ticks = 0u;
-    g_motor.bemf_average_interval_ticks =
-        MOTOR_GetBemfInitialIntervalTicks(MOTOR_GetSixStepBemfIntervalTicks(DRIVER_BLIND_6STEP_START_RPM));
-    g_motor.bemf_last_zc_ticks = g_motor.bemf_average_interval_ticks;
-    g_motor.bemf_this_zc_ticks = g_motor.bemf_average_interval_ticks;
-    g_motor.bemf_blank_ticks = 0u;
-    g_motor.bemf_poll_count = 0u;
-    g_motor.bemf_zero_cross_count = 0u;
-    g_motor.bemf_slow_update_tick = 0u;
-    g_motor.bemf_edge_seen = 1u;
-    g_motor.bemf_armed = 0u;
-    g_motor.bemf_readable = 0u;
-    g_motor.bemf_phase_mask = 0u;
-    g_motor.bemf_led_phase_mask = 0u;
-    g_motor.sixstep_bemf_closed_loop = 0u;
-    g_motor.sixstep_commutation_pending = 0u;
-    g_motor.sixstep_closed_loop_handoff_steps = 0u;
-    g_motor.sixstep_phase = MOTOR_SIXSTEP_PHASE_ZERO_ALIGN;
-    g_motor.sixstep_handoff_coast_done = 0u;
-    g_motor.in_rpm = 1u;
-
-    (void)MOTOR_UpdateBlindSixStepPwm();
-    MOTOR_UpdateBemfWaitTime();
-    MOTOR_UpdateBemfMeasuredErpm();
-    MOTOR_UpdateBemfFilterLevel();
-    BOARD_DisableBemfCommutationTimer();
-    BOARD_SetBemfIntervalTicks(MOTOR_BEMF_START_COUNTER_TICKS);
-    BEMF_AM32_MaskPhaseInterrupts();
-    MOTOR_ApplySixStepBridge();
 }
 
 static void MOTOR_SixStepTickIrq(void)
 {
-    if (MOTOR_ServiceBlindSixStepZeroStart() != 0u)
-    {
-        return;
-    }
-
     if (g_motor.sixstep_interval_ticks == 0u)
     {
         BOARD_AllPhasesOff();
@@ -2336,15 +2281,12 @@ static void MOTOR_SixStepTickIrq(void)
         g_motor.sixstep_run_ticks++;
     }
 
-    MOTOR_ServiceBemfBlank();
-
-    if (MOTOR_ServiceBemfCoastWait() != 0u)
+    if (MOTOR_ServiceBemfRecoveryOff() != 0u)
     {
         return;
     }
 
-    MOTOR_ServiceBlindSixStepOpenLoopSpeedRamp();
-    MOTOR_ServiceBlindSixStepOpenLoopDutyRamp();
+    MOTOR_ServiceBemfBlank();
 
     if (g_motor.sixstep_bemf_closed_loop != 0u)
     {
@@ -2353,7 +2295,12 @@ static void MOTOR_SixStepTickIrq(void)
             return;
         }
 
-        MOTOR_UpdateSixStepClosedLoopDuty();
+        MOTOR_ServiceSixStepClosedLoopPwmControl();
+        return;
+    }
+
+    if (g_motor.sixstep_commutation_pending != 0u)
+    {
         return;
     }
 
@@ -2363,142 +2310,43 @@ static void MOTOR_SixStepTickIrq(void)
     {
         g_motor.sixstep_tick = 0u;
         MOTOR_AdvanceSixStepStep();
-        MOTOR_DecayBemfFallbackOpenLoopSpeed();
     }
 
     g_motor.measured_erpm = g_motor.ramped_target_rpm * (int32_t)MOTOR_GetPolePairs();
     g_motor.in_rpm = 1u;
 }
 
-static uint8_t MOTOR_isBemfPhaseSetComplete(void)
-{
-    if ((g_motor.bemf_phase_mask & MOTOR_BEMF_ALL_PHASES_MASK) == MOTOR_BEMF_ALL_PHASES_MASK)
-    {
-        return 1u;
-    }
-
-    return 0u;
-}
-
-static MOTOR_FAST_CODE uint8_t MOTOR_isBemfReadableCandidate(void)
-{
-    if ((g_motor.bemf_zero_cross_count >= DRIVER_SIXSTEP_BEMF_OK_COUNT) &&
-        (MOTOR_isBemfPhaseSetComplete() != 0u))
-    {
-        return 1u;
-    }
-
-    return 0u;
-}
-
-static MOTOR_FAST_CODE uint8_t MOTOR_isBemfLockReady(void)
-{
-    const uint16_t lock_count = DRIVER_SIXSTEP_BEMF_OK_COUNT +
-                                DRIVER_SIXSTEP_BEMF_LOCK_EXTRA_COUNT;
-
-    if ((g_motor.bemf_zero_cross_count >= lock_count) &&
-        (MOTOR_isBemfPhaseSetComplete() != 0u))
-    {
-        return 1u;
-    }
-
-    return 0u;
-}
-
-static MOTOR_FAST_CODE uint8_t MOTOR_isBlindSixStepCoastHandoffSpeed(void)
-{
-    if (MOTOR_GetAbsRpm(g_motor.ramped_target_rpm) >=
-        (uint32_t)DRIVER_BLIND_6STEP_COAST_HANDOFF_MIN_RPM)
-    {
-        return 1u;
-    }
-
-    return 0u;
-}
-
 static MOTOR_FAST_CODE void MOTOR_EnableBemfClosedLoop(void)
 {
-    const uint8_t bridge_is_coasting =
-        (g_motor.sixstep_phase == MOTOR_SIXSTEP_PHASE_BEMF_COAST_WAIT) ? 1u : 0u;
-
     if (g_motor.sixstep_bemf_closed_loop != 0u)
     {
         return;
     }
 
     g_motor.sixstep_bemf_closed_loop = 1u;
-    g_motor.sixstep_handoff_coast_done = 1u;
     g_motor.sixstep_phase = MOTOR_SIXSTEP_PHASE_CLOSED_LOOP;
     g_motor.sixstep_interval_ticks =
         MOTOR_GetControlTicksFromBemfInterval(g_motor.bemf_average_interval_ticks);
     MOTOR_UpdateAdaptiveSixStepPwmCarrier();
+    MOTOR_ResetSixStepClosedLoopControl();
     g_motor.sixstep_tick = 0u;
-    g_motor.sixstep_speed_control_tick = 0u;
-    g_motor.sixstep_relock_scan_steps = 0u;
     g_motor.sixstep_commutation_pending = 0u;
-    g_motor.sixstep_missed_zc_blind_steps = 0u;
-
-    if (MOTOR_isBlindSixStepTestMode())
-    {
-        g_motor.sixstep_closed_loop_handoff_steps =
-            DRIVER_BLIND_6STEP_CLOSED_LOOP_HANDOFF_STEPS;
-
-        if (g_motor.sixstep_closed_loop_handoff_steps == 0u)
-        {
-            MOTOR_UpdateBlindSixStepClosedLoopPwm();
-        }
-        else
-        {
-            g_motor.sixstep_pwm_ticks = g_motor.sixstep_pwm_limit_ticks;
-        }
-
-        if (bridge_is_coasting == 0u)
-        {
-            MOTOR_ApplySixStepBridge();
-        }
-    }
-    else
-    {
-        g_motor.sixstep_closed_loop_handoff_steps = 0u;
-    }
-}
-
-static MOTOR_FAST_CODE uint8_t MOTOR_ServiceBemfCoastWaitSync(void)
-{
-    uint8_t sync_count = DRIVER_SIXSTEP_BEMF_COAST_WAIT_SYNC_COUNT;
-
-    if (sync_count == 0u)
-    {
-        sync_count = 1u;
-    }
-
-    if (g_motor.bemf_zero_cross_count >= sync_count)
-    {
-        return 0u;
-    }
-
-    MOTOR_AdvanceSixStepStepIndex();
-    g_motor.sixstep_relock_scan_steps = 0u;
-    g_motor.bemf_last_zc_ticks = 0u;
-    g_motor.bemf_this_zc_ticks = 0u;
-    g_motor.bemf_edge_seen = 1u;
-    MOTOR_ArmBemfForSixStep();
-
-    return 1u;
+    g_motor.sixstep_missed_zc_count = 0u;
+    g_motor.sixstep_recovery_off_tick = 0u;
+    g_motor.sixstep_virtual_zc_pending = 0u;
+    g_motor.bemf_pwm_gating_close_pending = 0u;
+    g_motor.bemf_pwm_sample_valid = 0u;
+    g_motor.bemf_pwm_last_level = 0u;
+    MOTOR_ApplySixStepBridge();
 }
 
 static MOTOR_FAST_CODE void MOTOR_HandleBemfZeroCross(void)
 {
-    const uint8_t detected_phase_mask =
-        MOTOR_GetBemfPhaseMaskForInputStep(MOTOR_GetBemfInputStepForPwmStep(g_motor.sixstep_step));
-    const uint8_t zero_start_active =
-        (g_motor.sixstep_phase == MOTOR_SIXSTEP_PHASE_ZERO_BEMF_WAIT) ? 1u : 0u;
-    const uint8_t coast_wait_active =
-        (g_motor.sixstep_phase == MOTOR_SIXSTEP_PHASE_BEMF_COAST_WAIT) ? 1u : 0u;
     uint16_t captured_interval_ticks = g_motor.bemf_interval_ticks;
+    uint8_t confirm_count = DRIVER_SIN_TO_6STEP_BEMF_CONFIRM_ZC_COUNT;
 
     BEMF_AM32_MaskPhaseInterrupts();
-    BOARD_EnableBemfPwmSampleIrq(0u);
+    MOTOR_StopBemfPwmGating();
 
     if (captured_interval_ticks == 0u)
     {
@@ -2506,19 +2354,12 @@ static MOTOR_FAST_CODE void MOTOR_HandleBemfZeroCross(void)
         g_motor.bemf_interval_ticks = captured_interval_ticks;
     }
 
-    if (zero_start_active != 0u)
+    if (g_motor.sixstep_virtual_zc_pending != 0u)
     {
         captured_interval_ticks =
             MOTOR_LimitTickCount((uint32_t)captured_interval_ticks << 1u);
         g_motor.bemf_interval_ticks = captured_interval_ticks;
-    }
-    else if (g_motor.sixstep_missed_zc_blind_steps != 0u)
-    {
-        captured_interval_ticks =
-            MOTOR_LimitTickCount((uint32_t)captured_interval_ticks +
-                                 g_motor.sixstep_bemf_delay_ticks);
-        g_motor.bemf_interval_ticks = captured_interval_ticks;
-        g_motor.sixstep_missed_zc_blind_steps = 0u;
+        g_motor.sixstep_virtual_zc_pending = 0u;
     }
 
     g_motor.bemf_last_zc_ticks = g_motor.bemf_this_zc_ticks;
@@ -2527,100 +2368,125 @@ static MOTOR_FAST_CODE void MOTOR_HandleBemfZeroCross(void)
 
     g_motor.bemf_edge_seen = 1u;
     g_motor.bemf_poll_count = 0u;
-    g_motor.bemf_phase_mask |= detected_phase_mask;
-    g_motor.bemf_led_phase_mask |= detected_phase_mask;
+    g_motor.sixstep_missed_zc_count = 0u;
+    g_motor.sixstep_recovery_off_tick = 0u;
 
     if (g_motor.bemf_zero_cross_count < 0xFFu)
     {
         g_motor.bemf_zero_cross_count++;
     }
 
-    if (zero_start_active != 0u)
+    MOTOR_UpdateBemfDerivedTiming();
+
+    if (confirm_count == 0u)
     {
-        g_motor.bemf_average_interval_ticks = captured_interval_ticks;
-        MOTOR_UpdateBemfMeasuredErpm();
-        MOTOR_UpdateBemfFilterLevel();
-        MOTOR_UpdateBemfFallbackControlTicks();
-        g_motor.bemf_readable = 1u;
-        g_motor.sixstep_handoff_coast_done = 1u;
-        MOTOR_EnableBemfClosedLoop();
+        confirm_count = 1u;
     }
-    else if ((coast_wait_active != 0u) &&
-        (g_motor.sixstep_handoff_coast_done != 0u) &&
-        (MOTOR_isBemfMonitorOnlyMode() == 0u))
-    {
-        if (MOTOR_ServiceBemfCoastWaitSync() != 0u)
-        {
-            return;
-        }
 
-        MOTOR_UpdateBemfDerivedTiming();
+    if (g_motor.bemf_zero_cross_count >= confirm_count)
+    {
         g_motor.bemf_readable = 1u;
-        MOTOR_EnableBemfClosedLoop();
-    }
-    else
-    {
-        MOTOR_UpdateBemfDerivedTiming();
 
-        if (MOTOR_isBemfReadableCandidate() != 0u)
+        if (MOTOR_isBemfMonitorOnlyMode() == 0u)
         {
-            g_motor.bemf_readable = 1u;
-
-            if ((MOTOR_isBemfMonitorOnlyMode() == 0u) &&
-                (MOTOR_isBemfLockReady() != 0u))
-            {
-                if (g_motor.sixstep_handoff_coast_done == 0u)
-                {
-                    if (MOTOR_isBlindSixStepCoastHandoffSpeed() != 0u)
-                    {
-                        MOTOR_StartBemfHandoffCoast();
-                        return;
-                    }
-
-                    g_motor.sixstep_handoff_coast_done = 1u;
-                }
-
-                MOTOR_EnableBemfClosedLoop();
-            }
+            MOTOR_EnableBemfClosedLoop();
         }
     }
 
-    if ((g_motor.sixstep_bemf_closed_loop != 0u) &&
+    if (((g_motor.sixstep_phase == MOTOR_SIXSTEP_PHASE_SIN_HANDOFF) ||
+         (g_motor.sixstep_bemf_closed_loop != 0u)) &&
         (MOTOR_isBemfMonitorOnlyMode() == 0u))
     {
         g_motor.sixstep_bemf_delay_ticks =
-            MOTOR_GetBemfDelayTicks(g_motor.bemf_this_zc_ticks);
+            MOTOR_GetBemfVirtualCommutationDelayTicks(captured_interval_ticks);
         MOTOR_ScheduleBemfCommutation();
     }
 }
 
-static MOTOR_FAST_CODE void MOTOR_EnableBemfCompIrqFromPwmSample(void)
+static MOTOR_FAST_CODE void MOTOR_StopBemfPwmGating(void)
 {
-    if (MOTOR_isBemfPwmGatedMode() == 0u)
+    g_motor.bemf_pwm_gating_close_pending = 0u;
+    g_motor.bemf_pwm_sample_valid = 0u;
+    BOARD_EnableBemfPwmSampleIrq(0u);
+}
+
+static MOTOR_FAST_CODE uint8_t MOTOR_StartBemfPwmGating(void)
+{
+    if (MOTOR_isBemfPwmGatingEnabled() == 0u)
     {
+        return 0u;
+    }
+
+    if (MOTOR_PrepareBemfPwmGatingTicks(g_motor.sixstep_pwm_ticks) == 0u)
+    {
+        return 0u;
+    }
+
+    g_motor.bemf_pwm_gating_close_pending = 0u;
+    g_motor.bemf_pwm_last_level = MOTOR_GetBemfExpectedLevelBeforeZc();
+    g_motor.bemf_pwm_sample_valid = 1u;
+    BEMF_AM32_MaskPhaseInterrupts();
+    BOARD_SetBemfPwmSampleTicks(g_motor.bemf_pwm_gating_open_ticks);
+    BOARD_EnableBemfPwmSampleIrq(1u);
+
+    return 1u;
+}
+
+static MOTOR_FAST_CODE void MOTOR_CloseBemfPwmGatingWindow(void)
+{
+    BEMF_AM32_MaskPhaseInterrupts();
+    g_motor.bemf_pwm_gating_close_pending = 0u;
+    BOARD_SetBemfPwmSampleTicks(g_motor.bemf_pwm_gating_open_ticks);
+}
+
+static MOTOR_FAST_CODE void MOTOR_ServiceBemfPwmGatingIrq(void)
+{
+    if (MOTOR_isBemfPwmGatingEnabled() == 0u)
+    {
+        MOTOR_StopBemfPwmGating();
         return;
     }
 
-    if (MOTOR_isBemfArmed() == 0u)
-    {
-        return;
-    }
-
-    if (g_motor.bemf_blank_ticks != 0u)
-    {
-        return;
-    }
-
-    if ((g_motor.bemf_edge_seen != 0u) ||
+    if ((MOTOR_isBemfArmed() == 0u) ||
+        (g_motor.bemf_blank_ticks != 0u) ||
+        (g_motor.bemf_edge_seen != 0u) ||
         (g_motor.sixstep_commutation_pending != 0u))
     {
-        BOARD_EnableBemfPwmSampleIrq(0u);
+        BEMF_AM32_MaskPhaseInterrupts();
+        MOTOR_StopBemfPwmGating();
         return;
     }
 
-    BOARD_EnableBemfPwmSampleIrq(0u);
+    if (g_motor.bemf_pwm_gating_close_pending != 0u)
+    {
+        MOTOR_CloseBemfPwmGatingWindow();
+        return;
+    }
+
+    if (MOTOR_PrepareBemfPwmGatingTicks(g_motor.sixstep_pwm_ticks) == 0u)
+    {
+        MOTOR_StopBemfPwmGating();
+        BEMF_AM32_MaskPhaseInterrupts();
+        BEMF_AM32_EnableCompInterrupts();
+        return;
+    }
+
+    if (BOARD_GetPwmCounterTicks() >= g_motor.bemf_pwm_gating_close_ticks)
+    {
+        MOTOR_CloseBemfPwmGatingWindow();
+        return;
+    }
+
     BEMF_AM32_MaskPhaseInterrupts();
-    BEMF_AM32_EnableCompInterrupts();
+
+    if (MOTOR_isBemfPwmSampleZeroCross(BEMF_AM32_GetOutputLevel()) != 0u)
+    {
+        MOTOR_HandleBemfZeroCross();
+        return;
+    }
+
+    g_motor.bemf_pwm_gating_close_pending = 1u;
+    BOARD_SetBemfPwmSampleTicks(g_motor.bemf_pwm_gating_close_ticks);
 }
 
 static uint8_t MOTOR_isSinusReadyForSixStep(void)
@@ -2663,10 +2529,20 @@ void MOTOR_Init(void)
     g_motor.sinus_at_target_ticks = 0u;
     g_motor.sixstep_run_ticks = 0u;
     g_motor.sin_current_target_ma = DRIVER_SIN_CURRENT_TARGET_MA;
+    g_motor.sixstep_current_limit_ma = DRIVER_SIXSTEP_CURRENT_LIMIT_MA;
+    g_motor.hard_current_limit_ma = DRIVER_SIXSTEP_HARD_CURRENT_LIMIT_MA;
+    g_motor.hard_current_adc_threshold = MOTOR_GetCurrentAdcFromMilliAmps(g_motor.hard_current_limit_ma);
     g_motor.measured_current_ma = 0u;
     g_motor.control_tick_count = 0u;
     g_motor.sin_current_update_count = 0u;
+    g_motor.sixstep_speed_update_count = 0u;
+    g_motor.sixstep_current_limit_update_count = 0u;
+    g_motor.hard_current_fault_count = 0u;
     g_motor.sin_current_error_adc = 0;
+    g_motor.sixstep_target_rpm = DRIVER_SIXSTEP_TARGET_RPM;
+    g_motor.sixstep_measured_rpm = 0;
+    g_motor.sixstep_rpm_error = 0;
+    g_motor.sixstep_current_error_ma = 0;
     g_motor.sixstep_commutation_count = 0u;
     g_motor.current_adc_raw = 0u;
     g_motor.current_adc_filtered = 0u;
@@ -2678,19 +2554,28 @@ void MOTOR_Init(void)
     g_motor.sin_current_target_pwm_ticks = 0u;
     g_motor.sixstep_pwm_limit_ticks = 0u;
     g_motor.sixstep_pwm_ticks = 0u;
+    g_motor.sixstep_speed_pid_target_permille = 0u;
+    g_motor.sixstep_speed_pid_output_permille = 0u;
+    g_motor.sixstep_speed_pid_output_q16 = 0u;
+    g_motor.sixstep_speed_pid_rise_step_q16 = 0u;
+    g_motor.sixstep_speed_pid_fall_step_q16 = 0u;
+    g_motor.sixstep_current_limit_reduction_permille = 0u;
+    g_motor.sixstep_final_pwm_permille = 0u;
     g_motor.sixstep_interval_ticks = 0u;
     g_motor.sixstep_fallback_interval_ticks = 0u;
-    g_motor.sixstep_relock_scan_steps = 0u;
     g_motor.sixstep_tick = 0u;
-    g_motor.sixstep_speed_control_tick = 0u;
     g_motor.sixstep_bemf_delay_ticks = 0u;
+    g_motor.sixstep_recovery_off_tick = 0u;
     g_motor.bemf_interval_ticks = 0u;
     g_motor.bemf_average_interval_ticks = 1u;
     g_motor.bemf_last_zc_ticks = 0u;
     g_motor.bemf_this_zc_ticks = 0u;
-    g_motor.bemf_led_hold_ticks = 0u;
+    g_motor.bemf_pwm_gating_open_ticks = 0u;
+    g_motor.bemf_pwm_gating_close_ticks = 0u;
     g_motor.sinus_table_index = 0u;
     g_motor.sin_current_control_tick = 0u;
+    g_motor.sixstep_speed_control_tick = 0u;
+    g_motor.sixstep_current_limit_control_tick = 0u;
     g_motor.in_rpm = 0u;
     g_motor.bemf_readable = 0u;
     g_motor.bemf_blank_ticks = 0u;
@@ -2699,22 +2584,18 @@ void MOTOR_Init(void)
     g_motor.bemf_slow_update_tick = 0u;
     g_motor.bemf_edge_seen = 0u;
     g_motor.bemf_armed = 0u;
-    g_motor.bemf_phase_mask = 0u;
+    g_motor.bemf_pwm_gating_active_window = MOTOR_BEMF_PWM_SAMPLE_OFF_TIME;
+    g_motor.bemf_pwm_gating_close_pending = 0u;
+    g_motor.bemf_pwm_sample_valid = 0u;
+    g_motor.bemf_pwm_last_level = 0u;
     g_motor.sixstep_bemf_closed_loop = 0u;
+    g_motor.hard_current_fault = 0u;
     g_motor.sixstep_commutation_pending = 0u;
-    g_motor.sixstep_closed_loop_handoff_steps = 0u;
+    g_motor.sixstep_missed_zc_count = 0u;
+    g_motor.sixstep_virtual_zc_pending = 0u;
     g_motor.sixstep_phase = MOTOR_SIXSTEP_PHASE_OPEN_LOOP;
     g_motor.sixstep_step = 0u;
-    g_motor.sixstep_handoff_coast_done = 0u;
-    g_motor.sixstep_missed_zc_blind_steps = 0u;
     g_motor.pwm_pulses_per_sector = 0u;
-    g_motor.bemf_led_phase = MOTOR_BEMF_LED_PHASE_NONE;
-    g_motor.bemf_led_phase_mask = 0u;
-    g_motor.bemf_diag_phase = MOTOR_BEMF_LED_PHASE_A;
-    g_motor.bemf_diag_initialized = 0u;
-    g_motor.bemf_diag_level_a = 0u;
-    g_motor.bemf_diag_level_b = 0u;
-    g_motor.bemf_diag_level_c = 0u;
 
     BEMF_AM32_Init(&g_motor.bemf_interval_ticks,
                    &g_motor.bemf_average_interval_ticks,
@@ -2724,20 +2605,9 @@ void MOTOR_Init(void)
     MOTOR_ResetSinusCurrentControl();
     MOTOR_UpdateSixStepPwmLimit();
 
-    if (MOTOR_isBemfLedDiagnosticMode())
-    {
-        MOTOR_StartBemfLedDiagnostic();
-        return;
-    }
-
-    if (MOTOR_isBlindSixStepTestMode())
-    {
-        MOTOR_StartBlindSixStepTest();
-        return;
-    }
-
     MOTOR_UpdateSinusTiming(0);
     MOTOR_ApplySinusBridge();
+    MOTOR_UpdateStatusLed();
 }
 
 void MOTOR_SetTargetRpm(int32_t rpm, motor_direction_t direction)
@@ -2760,31 +2630,49 @@ void MOTOR_SetTargetRpm(int32_t rpm, motor_direction_t direction)
     g_motor.bemf_slow_update_tick = 0u;
     g_motor.bemf_edge_seen = 0u;
     g_motor.bemf_armed = 0u;
-    g_motor.bemf_phase_mask = 0u;
     g_motor.sixstep_step = 0u;
     g_motor.sixstep_commutation_count = 0u;
     g_motor.sixstep_run_ticks = 0u;
+    g_motor.sixstep_speed_update_count = 0u;
+    g_motor.sixstep_current_limit_update_count = 0u;
+    g_motor.sixstep_target_rpm = DRIVER_SIXSTEP_TARGET_RPM;
+    g_motor.sixstep_measured_rpm = 0;
+    g_motor.sixstep_rpm_error = 0;
+    g_motor.sixstep_current_limit_ma = DRIVER_SIXSTEP_CURRENT_LIMIT_MA;
+    g_motor.hard_current_limit_ma = DRIVER_SIXSTEP_HARD_CURRENT_LIMIT_MA;
+    g_motor.hard_current_adc_threshold = MOTOR_GetCurrentAdcFromMilliAmps(g_motor.hard_current_limit_ma);
+    g_motor.sixstep_current_error_ma = 0;
     g_motor.sixstep_fallback_interval_ticks = 0u;
-    g_motor.sixstep_relock_scan_steps = 0u;
     g_motor.sixstep_tick = 0u;
-    g_motor.sixstep_speed_control_tick = 0u;
     g_motor.sixstep_bemf_delay_ticks = 0u;
+    g_motor.sixstep_recovery_off_tick = 0u;
     g_motor.bemf_interval_ticks = 0u;
     g_motor.bemf_last_zc_ticks = 0u;
     g_motor.bemf_this_zc_ticks = 0u;
-    g_motor.bemf_led_hold_ticks = 0u;
+    g_motor.bemf_pwm_gating_open_ticks = 0u;
+    g_motor.bemf_pwm_gating_close_ticks = 0u;
+    g_motor.sixstep_speed_control_tick = 0u;
+    g_motor.sixstep_current_limit_control_tick = 0u;
+    g_motor.sixstep_speed_pid_target_permille = 0u;
+    g_motor.sixstep_speed_pid_output_permille = 0u;
+    g_motor.sixstep_speed_pid_output_q16 = 0u;
+    g_motor.sixstep_speed_pid_rise_step_q16 = 0u;
+    g_motor.sixstep_speed_pid_fall_step_q16 = 0u;
+    g_motor.sixstep_current_limit_reduction_permille = 0u;
+    g_motor.sixstep_final_pwm_permille = 0u;
     g_motor.sixstep_bemf_closed_loop = 0u;
+    g_motor.hard_current_fault = 0u;
     g_motor.sixstep_commutation_pending = 0u;
-    g_motor.sixstep_closed_loop_handoff_steps = 0u;
+    g_motor.sixstep_missed_zc_count = 0u;
+    g_motor.sixstep_virtual_zc_pending = 0u;
     g_motor.sixstep_phase = MOTOR_SIXSTEP_PHASE_OPEN_LOOP;
-    g_motor.sixstep_handoff_coast_done = 0u;
-    g_motor.sixstep_missed_zc_blind_steps = 0u;
-    g_motor.bemf_led_phase = MOTOR_BEMF_LED_PHASE_NONE;
-    g_motor.bemf_led_phase_mask = 0u;
-    g_motor.bemf_diag_initialized = 0u;
+    g_motor.bemf_pwm_gating_active_window = MOTOR_BEMF_PWM_SAMPLE_OFF_TIME;
+    g_motor.bemf_pwm_gating_close_pending = 0u;
+    g_motor.bemf_pwm_sample_valid = 0u;
+    g_motor.bemf_pwm_last_level = 0u;
     MOTOR_RestoreDefaultPwmCarrier();
     BEMF_AM32_MaskPhaseInterrupts();
-    BOARD_EnableBemfPwmSampleIrq(0u);
+    MOTOR_StopBemfPwmGating();
     BOARD_DisableBemfCommutationTimer();
     MOTOR_ResetSinusCurrentControl();
     MOTOR_UpdateSinusTiming(0);
@@ -2793,13 +2681,15 @@ void MOTOR_SetTargetRpm(int32_t rpm, motor_direction_t direction)
 void MOTOR_ControlTick10kHz(void)
 {
     BOARD_ServiceCurrentAdc();
+    MOTOR_UpdateCurrentMeasurementFromAdc();
     g_motor.control_tick_count++;
 
-    if (MOTOR_isBemfLedDiagnosticMode())
+    if (MOTOR_ServiceHardCurrentProtection() != 0u)
     {
-        MOTOR_BemfLedDiagnosticTick();
         return;
     }
+
+    MOTOR_UpdateStatusLed();
 
     if (g_motor.mode == MOTOR_MODE_SINUS)
     {
@@ -2902,19 +2792,20 @@ MOTOR_FAST_CODE void MOTOR_BemfZeroCrossIrq(void)
     MOTOR_HandleBemfZeroCross();
 }
 
+
 MOTOR_FAST_CODE void MOTOR_BemfPwmSampleIrq(void)
 {
     if (g_motor.mode != MOTOR_MODE_SIXSTEP)
     {
-        BOARD_EnableBemfPwmSampleIrq(0u);
+        MOTOR_StopBemfPwmGating();
         return;
     }
 
-    if (MOTOR_isBemfPwmGatedMode() == 0u)
+    if (MOTOR_isBemfPwmGatingEnabled() == 0u)
     {
-        BOARD_EnableBemfPwmSampleIrq(0u);
+        MOTOR_StopBemfPwmGating();
         return;
     }
 
-    MOTOR_EnableBemfCompIrqFromPwmSample();
+    MOTOR_ServiceBemfPwmGatingIrq();
 }

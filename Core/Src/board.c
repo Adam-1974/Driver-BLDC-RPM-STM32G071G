@@ -21,6 +21,13 @@
 #define BOARD_TIM_CH2_FORCE_INACTIVE    (TIM_CCMR1_OC2M_2 | TIM_CCMR1_OC2PE)
 #define BOARD_TIM_CH3_FORCE_INACTIVE    (TIM_CCMR2_OC3M_2 | TIM_CCMR2_OC3PE)
 #define BOARD_PWM_PERIOD_UPDATE_DEADBAND_TICKS 4u
+#define BOARD_CURRENT_ADC_SAMPLE_TIME ADC_SAMPLETIME_19CYCLES_5
+#define BOARD_STATUS_LED_T0H_CYCLES    1u
+#define BOARD_STATUS_LED_T0L_CYCLES    28u
+#define BOARD_STATUS_LED_T1H_CYCLES    13u
+#define BOARD_STATUS_LED_T1L_CYCLES    12u
+#define BOARD_STATUS_LED_RESET_CYCLES  4000u
+#define BOARD_STATUS_LED_LEVEL         8u
 
 static uint32_t s_pwm_timer_clock_hz;
 static uint32_t s_pwm_carrier_hz;
@@ -33,6 +40,8 @@ static uint16_t s_current_adc_filtered;
 static uint32_t s_current_adc_filter_accumulator;
 static uint8_t s_current_adc_ready;
 static uint8_t s_current_adc_filter_ready;
+static uint8_t s_status_led_state = 0xFFu;
+static uint8_t s_status_led_initialized;
 
 #if defined(__GNUC__)
 #define BOARD_FAST_CODE                 __attribute__((optimize("O2")))
@@ -123,6 +132,93 @@ static BOARD_FAST_CODE void BOARD_WriteLowSide(GPIO_TypeDef *port, uint16_t pin,
     port->BSRR = ((uint32_t)pin << 16u);
 }
 
+static BOARD_FAST_CODE void BOARD_StatusLedDelay(uint32_t cycles)
+{
+    while (cycles > 0u)
+    {
+        __NOP();
+        cycles--;
+    }
+}
+
+static BOARD_FAST_CODE void BOARD_WriteStatusLedBit(uint8_t bit_is_one)
+{
+    BOARD_PORT_STATUS_LED->BSRR = BOARD_PIN_STATUS_LED;
+
+    if (bit_is_one != 0u)
+    {
+        BOARD_StatusLedDelay(BOARD_STATUS_LED_T1H_CYCLES);
+        BOARD_PORT_STATUS_LED->BSRR = ((uint32_t)BOARD_PIN_STATUS_LED << 16u);
+        BOARD_StatusLedDelay(BOARD_STATUS_LED_T1L_CYCLES);
+        return;
+    }
+
+    BOARD_StatusLedDelay(BOARD_STATUS_LED_T0H_CYCLES);
+    BOARD_PORT_STATUS_LED->BSRR = ((uint32_t)BOARD_PIN_STATUS_LED << 16u);
+    BOARD_StatusLedDelay(BOARD_STATUS_LED_T0L_CYCLES);
+}
+
+static BOARD_FAST_CODE void BOARD_WriteStatusLedByte(uint8_t value)
+{
+    uint8_t mask = 0x80u;
+
+    while (mask != 0u)
+    {
+        BOARD_WriteStatusLedBit((value & mask) != 0u);
+        mask >>= 1u;
+    }
+}
+
+static void BOARD_WriteStatusLedColor(uint8_t red, uint8_t green, uint8_t blue)
+{
+    uint32_t primask = __get_PRIMASK();
+
+    __disable_irq();
+    BOARD_WriteStatusLedByte(green);
+    BOARD_WriteStatusLedByte(red);
+    BOARD_WriteStatusLedByte(blue);
+    BOARD_PORT_STATUS_LED->BSRR = ((uint32_t)BOARD_PIN_STATUS_LED << 16u);
+    BOARD_StatusLedDelay(BOARD_STATUS_LED_RESET_CYCLES);
+
+    if (primask == 0u)
+    {
+        __enable_irq();
+    }
+}
+
+void BOARD_SetStatusLed(uint8_t status)
+{
+#if DRIVER_STATUS_LED_ENABLE
+    uint8_t red = 0u;
+    uint8_t green = 0u;
+    uint8_t blue = 0u;
+
+    if (s_status_led_initialized == 0u)
+    {
+        return;
+    }
+
+    if (status == s_status_led_state)
+    {
+        return;
+    }
+
+    if (status == BOARD_STATUS_LED_RED)
+    {
+        red = BOARD_STATUS_LED_LEVEL;
+    }
+    else if (status == BOARD_STATUS_LED_GREEN)
+    {
+        green = BOARD_STATUS_LED_LEVEL;
+    }
+
+    s_status_led_state = status;
+    BOARD_WriteStatusLedColor(red, green, blue);
+#else
+    (void)status;
+#endif
+}
+
 static BOARD_FAST_CODE void BOARD_SetTimerChannelModes(uint8_t phase_a_pwm,
                                                        uint8_t phase_b_pwm,
                                                        uint8_t phase_c_pwm)
@@ -201,6 +297,8 @@ static BOARD_FAST_CODE void BOARD_UpdateCurrentAdcFilter(uint16_t adc_raw)
     s_current_adc_filtered = (uint16_t)(s_current_adc_filter_accumulator >> shift);
 }
 
+
+
 void BOARD_InitStaticOutputs(void)
 {
     GPIO_InitTypeDef gpio = { 0 };
@@ -220,6 +318,12 @@ void BOARD_InitStaticOutputs(void)
 
     gpio.Pin = BOARD_PIN_LC;
     HAL_GPIO_Init(BOARD_PORT_LC, &gpio);
+
+    gpio.Pin = BOARD_PIN_STATUS_LED;
+    HAL_GPIO_Init(BOARD_PORT_STATUS_LED, &gpio);
+    BOARD_PORT_STATUS_LED->BSRR = ((uint32_t)BOARD_PIN_STATUS_LED << 16u);
+    s_status_led_initialized = 1u;
+    BOARD_SetStatusLed(BOARD_STATUS_LED_OFF);
 
     BOARD_AllPhasesOff();
 }
@@ -303,8 +407,8 @@ void BOARD_InitCurrentAdc(void)
     s_current_adc.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
     s_current_adc.Init.DMAContinuousRequests = ENABLE;
     s_current_adc.Init.Overrun = ADC_OVR_DATA_OVERWRITTEN;
-    s_current_adc.Init.SamplingTimeCommon1 = ADC_SAMPLETIME_160CYCLES_5;
-    s_current_adc.Init.SamplingTimeCommon2 = ADC_SAMPLETIME_160CYCLES_5;
+    s_current_adc.Init.SamplingTimeCommon1 = BOARD_CURRENT_ADC_SAMPLE_TIME;
+    s_current_adc.Init.SamplingTimeCommon2 = BOARD_CURRENT_ADC_SAMPLE_TIME;
     s_current_adc.Init.OversamplingMode = DISABLE;
     s_current_adc.Init.TriggerFrequencyMode = ADC_TRIGGER_FREQ_HIGH;
 
@@ -348,6 +452,7 @@ void BOARD_InitCurrentAdc(void)
         return;
     }
 
+
     if (HAL_ADC_Start_DMA(&s_current_adc,
                           (uint32_t *)(void *)&s_current_adc_dma_sample,
                           1u) != HAL_OK)
@@ -357,7 +462,7 @@ void BOARD_InitCurrentAdc(void)
     }
 
     __HAL_ADC_DISABLE_IT(&s_current_adc, ADC_IT_EOC | ADC_IT_EOS | ADC_IT_OVR);
-    __HAL_ADC_CLEAR_FLAG(&s_current_adc, ADC_FLAG_EOC | ADC_FLAG_EOS | ADC_FLAG_OVR);
+    __HAL_ADC_CLEAR_FLAG(&s_current_adc, ADC_FLAG_EOC | ADC_FLAG_EOS | ADC_FLAG_OVR );
     DMA1_Channel1->CCR &= ~(DMA_CCR_TCIE | DMA_CCR_HTIE | DMA_CCR_TEIE);
 
     s_current_adc_ready = 1u;
@@ -481,6 +586,11 @@ void BOARD_AllPhasesOff(void)
 uint16_t BOARD_GetPwmPeriodTicks(void)
 {
     return s_pwm_period_ticks;
+}
+
+BOARD_FAST_CODE uint16_t BOARD_GetPwmCounterTicks(void)
+{
+    return (uint16_t)TIM1->CNT;
 }
 
 uint32_t BOARD_GetPwmCarrierHz(void)
@@ -757,6 +867,8 @@ BOARD_FAST_CODE void BOARD_ServiceCurrentAdc(void)
 
     BOARD_UpdateCurrentAdcFilter((uint16_t)(s_current_adc_dma_sample & 0x0FFFu));
 }
+
+
 
 BOARD_FAST_CODE uint16_t BOARD_GetCurrentAdcRaw(void)
 {

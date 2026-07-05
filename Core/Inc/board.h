@@ -37,6 +37,12 @@
 #define BOARD_PORT_CURRENT_FB           GPIOA
 #define BOARD_ADC_CURRENT_CHANNEL       ADC_CHANNEL_4
 
+#define BOARD_PIN_STATUS_LED            GPIO_PIN_8
+#define BOARD_PORT_STATUS_LED           GPIOB
+#define BOARD_STATUS_LED_OFF            0u
+#define BOARD_STATUS_LED_GREEN          1u
+#define BOARD_STATUS_LED_RED            2u
+
 #define BOARD_BEMF_COMP                 COMP2
 #define BOARD_BEMF_EXTI_LINE            LL_EXTI_LINE_18
 #define BOARD_BEMF_COMP_PLUS            LL_COMP_INPUT_PLUS_IO3
@@ -48,11 +54,13 @@ void BOARD_InitStaticOutputs(void);
 void BOARD_InitPwmOutputs(void);
 void BOARD_InitCurrentAdc(void);
 void BOARD_ServiceCurrentAdc(void);
+void BOARD_SetStatusLed(uint8_t status);
 void BOARD_InitBemfComparator(void);
 void BOARD_InitBemfTiming(void);
 void BOARD_InitControlTick(void);
 void BOARD_AllPhasesOff(void);
 uint16_t BOARD_GetPwmPeriodTicks(void);
+uint16_t BOARD_GetPwmCounterTicks(void);
 uint32_t BOARD_GetPwmCarrierHz(void);
 uint16_t BOARD_SetPwmCarrierHz(uint32_t carrier_hz);
 uint16_t BOARD_GetBemfIntervalTicks(void);

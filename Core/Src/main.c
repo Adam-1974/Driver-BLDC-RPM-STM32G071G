@@ -67,6 +67,21 @@ static void MAIN_CheckClockTree(void)
     }
 }
 
+static void MAIN_SettleCurrentAdcFilter(void)
+{
+    uint32_t settle_ms = DRIVER_CURRENT_ADC_STARTUP_SETTLE_MS;
+
+    BOARD_AllPhasesOff();
+
+    while (settle_ms > 0u)
+    {
+        HAL_Delay(1u);
+        BOARD_ServiceCurrentAdc();
+        BOARD_AllPhasesOff();
+        settle_ms--;
+    }
+}
+
 int main(void)
 {
     HAL_Init();
@@ -79,6 +94,7 @@ int main(void)
     BOARD_InitBemfComparator();
     BOARD_InitBemfTiming();
     NVM_LoadOrDefault();
+    MAIN_SettleCurrentAdcFilter();
     MOTOR_Init();
     BOARD_InitControlTick();
 

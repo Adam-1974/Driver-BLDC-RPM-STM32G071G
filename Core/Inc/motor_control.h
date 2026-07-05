@@ -5,19 +5,13 @@
 
 #include "app_config.h"
 
-#define MOTOR_BEMF_LED_PHASE_NONE       0u
-#define MOTOR_BEMF_LED_PHASE_A          1u
-#define MOTOR_BEMF_LED_PHASE_B          2u
-#define MOTOR_BEMF_LED_PHASE_C          3u
-#define MOTOR_BEMF_PHASE_A_MASK         0x01u
-#define MOTOR_BEMF_PHASE_B_MASK         0x02u
-#define MOTOR_BEMF_PHASE_C_MASK         0x04u
+#define MOTOR_BEMF_PWM_SAMPLE_OFF_TIME  0u
+#define MOTOR_BEMF_PWM_SAMPLE_ON_TIME   1u
 #define MOTOR_SIXSTEP_PHASE_OPEN_LOOP   0u
-#define MOTOR_SIXSTEP_PHASE_BEMF_ACQUIRE 1u
+#define MOTOR_SIXSTEP_PHASE_SIN_HANDOFF 1u
 #define MOTOR_SIXSTEP_PHASE_CLOSED_LOOP 2u
-#define MOTOR_SIXSTEP_PHASE_BEMF_COAST_WAIT 3u
-#define MOTOR_SIXSTEP_PHASE_ZERO_ALIGN  4u
-#define MOTOR_SIXSTEP_PHASE_ZERO_BEMF_WAIT 5u
+#define MOTOR_SIXSTEP_PHASE_RECOVERY_OFF 3u
+#define MOTOR_SIXSTEP_PHASE_CURRENT_FAULT 4u
 
 typedef struct
 {
@@ -33,10 +27,20 @@ typedef struct
     uint32_t sinus_at_target_ticks;
     uint32_t sixstep_run_ticks;
     uint32_t sin_current_target_ma;
+    uint32_t sixstep_current_limit_ma;
+    uint32_t hard_current_limit_ma;
+    uint16_t hard_current_adc_threshold;
     uint32_t measured_current_ma;
     uint32_t control_tick_count;
     uint32_t sin_current_update_count;
+    uint32_t sixstep_speed_update_count;
+    uint32_t sixstep_current_limit_update_count;
+    uint32_t hard_current_fault_count;
     int32_t sin_current_error_adc;
+    int32_t sixstep_target_rpm;
+    int32_t sixstep_measured_rpm;
+    int32_t sixstep_rpm_error;
+    int32_t sixstep_current_error_ma;
     uint16_t sixstep_commutation_count;
     uint16_t current_adc_raw;
     uint16_t current_adc_filtered;
@@ -48,18 +52,28 @@ typedef struct
     uint16_t sin_current_target_pwm_ticks;
     uint16_t sixstep_pwm_limit_ticks;
     uint16_t sixstep_pwm_ticks;
+    uint16_t sixstep_speed_pid_target_permille;
+    uint16_t sixstep_speed_pid_output_permille;
+    uint32_t sixstep_speed_pid_output_q16;
+    uint32_t sixstep_speed_pid_rise_step_q16;
+    uint32_t sixstep_speed_pid_fall_step_q16;
+    uint16_t sixstep_current_limit_reduction_permille;
+    uint16_t sixstep_final_pwm_permille;
     uint16_t sixstep_interval_ticks;
     uint16_t sixstep_fallback_interval_ticks;
     uint16_t sixstep_tick;
-    uint16_t sixstep_speed_control_tick;
     uint16_t sixstep_bemf_delay_ticks;
+    uint16_t sixstep_recovery_off_tick;
     volatile uint16_t bemf_interval_ticks;
     volatile uint16_t bemf_average_interval_ticks;
     uint16_t bemf_last_zc_ticks;
     uint16_t bemf_this_zc_ticks;
-    uint16_t bemf_led_hold_ticks;
+    uint16_t bemf_pwm_gating_open_ticks;
+    uint16_t bemf_pwm_gating_close_ticks;
     uint16_t sinus_table_index;
     uint16_t sin_current_control_tick;
+    uint16_t sixstep_speed_control_tick;
+    uint16_t sixstep_current_limit_control_tick;
     uint8_t in_rpm;
     uint8_t bemf_readable;
     uint8_t bemf_blank_ticks;
@@ -68,23 +82,18 @@ typedef struct
     uint8_t bemf_slow_update_tick;
     uint8_t bemf_edge_seen;
     uint8_t bemf_armed;
-    uint8_t bemf_phase_mask;
+    uint8_t bemf_pwm_gating_active_window;
+    uint8_t bemf_pwm_gating_close_pending;
+    uint8_t bemf_pwm_sample_valid;
+    uint8_t bemf_pwm_last_level;
     uint8_t sixstep_bemf_closed_loop;
+    uint8_t hard_current_fault;
     uint8_t sixstep_commutation_pending;
-    uint8_t sixstep_closed_loop_handoff_steps;
+    uint8_t sixstep_missed_zc_count;
+    uint8_t sixstep_virtual_zc_pending;
     uint8_t sixstep_phase;
     uint8_t sixstep_step;
-    uint8_t sixstep_handoff_coast_done;
-    uint8_t sixstep_relock_scan_steps;
-    uint8_t sixstep_missed_zc_blind_steps;
     uint8_t pwm_pulses_per_sector;
-    uint8_t bemf_led_phase;
-    uint8_t bemf_led_phase_mask;
-    uint8_t bemf_diag_phase;
-    uint8_t bemf_diag_initialized;
-    uint8_t bemf_diag_level_a;
-    uint8_t bemf_diag_level_b;
-    uint8_t bemf_diag_level_c;
 } motor_control_state_t;
 
 extern volatile motor_control_state_t g_motor;

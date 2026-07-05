@@ -22,15 +22,20 @@ STM32G071GBU6, rdzen Cortex-M0+, taktowanie startowe 64 MHz z HSI + PLL.
 
 2. 6-step
    - Faza plywajaca jest mierzona komparatorem wzgledem `BEMF_Vgnd`.
-   - Aktualny etap testowy startuje bezposrednio w 6-step open-loop, a po potwierdzeniu BEMF przechodzi na komutacje wyzwalana BEMF.
-   - Zbocze BEMF po locku wyznacza opoznienie do nastepnego kroku 6-step.
-   - PID predkosci wylicza prad zadany, ograniczony limitem NVM.
-   - Prad jest dalej pilnowany przez ograniczenie wypelnienia PWM.
+   - 6-step jest uruchamiany po przejsciu z sinusa.
+   - Pierwsze sektory po przejsciu pracuja jako handoff open-loop z czasem sektora przejetym z sinusa.
+   - Po potwierdzeniu BEMF sterownik przechodzi do closed-loop 6-step.
+   - ZC BEMF wyznacza opoznienie do nastepnego kroku 6-step.
+   - W closed-loop 6-step wypelnienie PWM ustawia PID RPM, a ogranicznik pradu zmniejsza PWM po przekroczeniu limitu [mA].
+- Niezaleznie od regulatorow dziala twardy fault pradowy liczony z pomiaru ADC po filtrze IIR. To kompromis dla obecnej PCB, gdzie surowy tor ADC lapie zaklocenia komutacji.
 
 ## Przejscie trybow
 
-- Aktualny etap testowy ma wlaczony `DRIVER_TEST_BLIND_6STEP_ONLY`, wiec sinus i przejscie SINUS -> 6-step nie sa uzywane w biezacym tescie.
-- Najpierw 6-step pracuje open-loop ze stalym RPM i PWM, potem po poprawnych zboczach BEMF sterownik przechodzi na komutacje z BEMF.
+- SINUS -> 6-step: po osiagnieciu `DRIVER_OPEN_LOOP_SINUS_RPM` sinus pracuje jeszcze przez `DRIVER_SIN_TO_6STEP_SETTLE_MECH_REV` obrotow mechanicznych.
+- Startowy sektor 6-step jest wyliczany z aktualnego kata elektrycznego sinusa.
+- Handoff 6-step bierze czas sektora z ostatniej predkosci sinusa.
+- Handoff 6-step bierze PWM z sinusa przeskalowany przez `DRIVER_SIN_TO_6STEP_PWM_SCALE_PERMILLE`.
+- Po `DRIVER_SIN_TO_6STEP_BEMF_CONFIRM_ZC_COUNT` poprawnych ZC sterownik przechodzi do closed-loop 6-step.
 - Docelowo SINUS -> 6-step: RPM powyzej progu NVM i czytelny BEMF.
 - 6-step -> SINUS: RPM ponizej progu przejscia minus histereza NVM.
 
@@ -38,7 +43,9 @@ STM32G071GBU6, rdzen Cortex-M0+, taktowanie startowe 64 MHz z HSI + PLL.
 
 - Startowo stala czestotliwosc nosna: 14 kHz.
 - Docelowo w 6-step modulowana jest wysoka faza, dolna aktywna faza jest zapinana do GND, a faza niepracujaca ma gorna i dolna galaz off dla pomiaru BEMF.
-- Limit testowy wypelnienia w 6-step jest osobny: `DRIVER_OPEN_LOOP_6STEP_MAX_DUTY_PERMILLE`.
+- Limit wypelnienia w 6-step jest ustawiany przez `DRIVER_SIXSTEP_MAX_DUTY_PERMILLE`.
+- W closed-loop 6-step wypelnienie PWM wynika z regulatora RPM i ogranicznika pradu.
+- W 6-step nosna PWM moze byc dynamicznie dobrana przez `DRIVER_PWM_DYNAMIC_6STEP_ENABLE`, `DRIVER_PWM_6STEP_TARGET_PULSES_PER_SECTOR` i limit `DRIVER_PWM_6STEP_MAX_CARRIER_HZ`.
 - W aktualnym etapie SINUS open-loop uzywane sa trzy pary komplementarne TIM1: `HC/LC`, `HB/LB`, `HA/LA`.
 - TIM1 pracuje z preload dla CCR1/CCR2/CCR3, zeby nowe wypelnienia trzech faz byly przenoszone przez zdarzenie update PWM.
 - Dead-time nie jest dodawany w STM32, bo realizuje go zewnetrzny driver MOSFET.
@@ -61,53 +68,66 @@ STM32G071GBU6, rdzen Cortex-M0+, taktowanie startowe 64 MHz z HSI + PLL.
 - Kazda probka sinus jest mnozona przez limit `DRIVER_OPEN_LOOP_MAX_DUTY_PERMILLE`, czyli przebieg jest skalowany do maksymalnego wypelnienia, a nie ucinany od gory.
 - Ten etap wykorzystuje trzy przesuniete fazowo kanaly PWM dla startu sinusoidalnego, bez fazy `LOW` i bez fazy `FLOAT`.
 - Test sprzetowy potwierdzil dzialanie trzech par PWM po korekcie mapowania `LA`: fizyczny pin 15 pracuje jako `PB1 / TIM1_CH3N`.
-- Po osiagnieciu zadanej predkosci sterownik przechodzi do testowego 6-step open-loop.
-- PID pradu jest odlozony na kolejny krok.
+- Po osiagnieciu zadanej predkosci i czasie stabilizacji sterownik przechodzi do 6-step handoff.
+- PID pradu sinusa ustawia wypelnienie PWM od zera przy kazdym uruchomieniu sinusa.
 
-## Etap 11 - 6-step open-loop z przejsciem na BEMF
+## Etap 11 - 6-step handoff i closed-loop BEMF
 
-- Aktualny build moze byc przelaczony w tryb pasywnej diagnostyki BEMF przez `DRIVER_BEMF_LED_DIAGNOSTIC_ONLY`.
-- W tym trybie mostek jest wylaczony, silnik nie startuje, a program probkuje komparatorem fazy A/B/C podczas recznego krecenia silnikiem.
-- WS2812 pokazuje ostatnia wykryta zmiane BEMF: faza A = czerwony, faza B = zielony, faza C = niebieski.
-- Aktualnie wlaczony jest tryb diagnostyczny `DRIVER_TEST_BLIND_6STEP_ONLY`.
-- W tym trybie sterownik startuje od razu w 6-step open-loop, bez sinusa i bez przejscia SINUS -> 6-step.
-- Parametry testu sa stale w programie:
-  - `DRIVER_BLIND_6STEP_RPM` - predkosc komutacji open-loop,
-  - `DRIVER_BLIND_6STEP_DUTY_PERMILLE` - stale wypelnienie PWM; wartosc `100` oznacza 10%,
-  - `DRIVER_BLIND_6STEP_START_STEP` - sektor startowy 6-step.
-- BEMF nie jest uzbrajany od razu. Sterownik najpierw odczekuje `DRIVER_SIXSTEP_BEMF_ARM_DELAY_MS`, `DRIVER_SIXSTEP_BEMF_ARM_AFTER_MECH_REV` i `DRIVER_SIXSTEP_BEMF_ARM_AFTER_STEPS`.
-- Po uzbrojeniu BEMF kolejne poprawne zbocza sa zliczane. `bemf_readable` ustawia sie dopiero po `DRIVER_SIXSTEP_BEMF_OK_COUNT` zboczach i po zobaczeniu wszystkich trzech faz plywajacych.
-- Po ustawieniu `bemf_readable` sterownik przestaje komutowac z samego timera open-loop. Zbocze BEMF zapisuje interwal TIM2, zeruje TIM2 i ustawia TIM14 na `waitTime`.
-- `waitTime` jest liczony jak w AM32: okolo polowy interwalu sektora minus `bemf_action_angle_offset_deg_x10`.
-- TIM2 i TIM14 dla BEMF pracuja z zegarem 2 MHz, czyli jedna jednostka czasu ma 0,5 us jak w AM32 dla STM32G071.
-- Po przerwaniu TIM14 wykonywany jest kolejny krok 6-step, a sredni interwal BEMF jest aktualizowany z `lastzctime/thiszctime` dla nastepnego sektora.
-- Jesli po locku nie pojawi sie kolejne zbocze BEMF w oczekiwanym czasie, sterownik kasuje lock i wraca do komutacji open-loop.
-- Dla tego testu wyjscia high sa zawsze sterowane przez TIM1: tylko aktywna faza ma tryb PWM, a pozostale kanaly high sa ustawiane w tryb forced inactive. To eliminuje przypadek, w ktorym nieaktywne wejscia high drivera moglyby plywac albo zachowywac poprzedni PWM.
-
-## Etap 12 - przejscie SINUS -> 6-step open-loop
-
-- Ten etap zostaje odlozony do czasu potwierdzenia, ze 6-step i BEMF dzialaja poprawnie oddzielnie.
-- Warunek przejscia: `g_motor.ramped_target_rpm == DRIVER_OPEN_LOOP_SINUS_RPM`.
-- Po osiagnieciu zadanej predkosci sinus musi jeszcze pracowac przez `DRIVER_SIN_TO_6STEP_SETTLE_MECH_REV` obrotow mechanicznych. To zabezpiecza przypadek testowy, gdy `DRIVER_OPEN_LOOP_START_RPM == DRIVER_OPEN_LOOP_SINUS_RPM` i rampa formalnie konczy sie natychmiast po align.
-- Startowy sektor 6-step jest wyliczany z aktualnego kata elektrycznego sinusa przez dopasowanie najblizszego wektora 6-step. Dla kata sinusa `0 deg` najblizszy jest sektor 5, nie sektor 1.
+- Warunek przejscia: `g_motor.ramped_target_rpm == DRIVER_OPEN_LOOP_SINUS_RPM` oraz uplyw `DRIVER_SIN_TO_6STEP_SETTLE_MECH_REV` obrotow mechanicznych.
+- Startowy sektor 6-step jest wyliczany z aktualnego kata elektrycznego sinusa przez dopasowanie najblizszego wektora 6-step.
 - Kierunek `MOTOR_DIRECTION_CW` przechodzi po sektorach rosnaco 1 -> 6. `MOTOR_DIRECTION_CCW` przechodzi po sektorach malejaco 6 -> 1. Ta sama zmienna `DRIVER_OPEN_LOOP_DIRECTION` steruje kierunkiem w SINUS i w 6-step.
-- Sekwencja sektorow jest zgodna z AM32 `comStep()`:
+- Sekwencja sektorow 6-step:
   - 1: A PWM, B LOW, C FLOAT,
   - 2: C PWM, B LOW, A FLOAT,
   - 3: C PWM, A LOW, B FLOAT,
   - 4: B PWM, A LOW, C FLOAT,
   - 5: B PWM, C LOW, A FLOAT,
   - 6: A PWM, C LOW, B FLOAT.
-- Wypelnienie startowe 6-step bierze limit sinusa i ogranicza go przez `DRIVER_OPEN_LOOP_6STEP_MAX_DUTY_PERMILLE`.
-- Czas sektora jest liczony z ostatniej predkosci sinusa, liczby par biegunow i 6 sektorow na obrot elektryczny.
-- Po wejsciu w 6-step BEMF nie jest uzbrajany od razu. Sterownik czeka jednoczesnie na:
-  - minimalny czas pracy 6-step `DRIVER_SIXSTEP_BEMF_ARM_DELAY_MS`,
-  - minimalna liczbe obrotow mechanicznych `DRIVER_SIXSTEP_BEMF_ARM_AFTER_MECH_REV`,
-  - minimalna liczbe sektorow `DRIVER_SIXSTEP_BEMF_ARM_AFTER_STEPS`.
-- Dopiero po spelnieniu tych warunkow wlaczane sa przerwania komparatora BEMF. Ma to odfiltrowac impulsy od samego przelaczenia mostka i zbyt wczesne potwierdzenie BEMF.
-- Po kazdej komutacji BEMF jest maskowany przez `DRIVER_SIXSTEP_BEMF_BLANK_TICKS`.
-- `bemf_readable` ustawia sie po `DRIVER_SIXSTEP_BEMF_OK_COUNT` poprawnych zboczach w oknie czasowym sektora i dopiero gdy zbocza wystapily na wszystkich trzech fazach plywajacych.
-- W biezacym tescie standalone BEMF po potwierdzeniu wykonuje juz komutacje. W scenariuszu SINUS -> 6-step ta sama mechanika bedzie podlaczona pozniej.
+- Wypelnienie startowe 6-step bierze aktualne PWM z sinusa przeskalowane przez `DRIVER_SIN_TO_6STEP_PWM_SCALE_PERMILLE`.
+- Po kazdej komutacji BEMF ma blanking `DRIVER_SIXSTEP_BEMF_BLANK_TICKS`.
+- `bemf_readable` ustawia sie po `DRIVER_SIN_TO_6STEP_BEMF_CONFIRM_ZC_COUNT` poprawnych ZC.
+- Po potwierdzeniu BEMF sterownik wlacza closed-loop 6-step, resetuje PID RPM i ogranicznik pradu, a PWM startuje od `DRIVER_SIXSTEP_RPM_PID_START_DUTY_PERMILLE`.
+- PID RPM reguluje wypelnienie PWM do `DRIVER_SIXSTEP_TARGET_RPM`.
+- Dynamika wyjscia PID RPM ma osobne limity: wzrost przez `DRIVER_SIXSTEP_RPM_PID_MAX_RISE_PER_SEC_PERMILLE`, a spadek przez `DRIVER_SIXSTEP_RPM_PID_MAX_FALL_PER_SEC_PERMILLE`.
+- Limity sa podane w promilach na sekunde i przeliczane na krok aktualizacji PID wedlug `DRIVER_SIXSTEP_RPM_PID_UPDATE_DIVIDER_TICKS`.
+- Limiter dynamiki dziala za PID RPM: `sixstep_speed_pid_target_permille` pokazuje wartosc zadana przez PID, a `sixstep_speed_pid_output_permille` pokazuje wartosc po ograniczeniu rise/fall.
+- Wewnatrz limiter pracuje w Q16 (`sixstep_speed_pid_output_q16`), wiec male wartosci promile/s nie gina przez zaokraglanie do calych promili na jedna aktualizacje.
+- `sixstep_final_pwm_permille` pokazuje PWM po odjeciu ogranicznika pradu; jesli rozni sie od `sixstep_speed_pid_output_permille`, reakcje silnika maskuje ogranicznik pradowy.
+- Ogranicznik pradu zmniejsza wypelnienie PWM, gdy `measured_current_ma` przekroczy `DRIVER_SIXSTEP_CURRENT_LIMIT_MA`.
+- Twardy limit `DRIVER_SIXSTEP_HARD_CURRENT_LIMIT_MA` nie jest regulatorem; szczegoly toru zabezpieczenia opisuje sekcja "Twarde zabezpieczenie pradowe po IIR ADC".
+- W closed-loop ZC synchronizuje filtr okresu i miekko koryguje faze; fizyczna komutacja idzie z wirtualnego komutatora planowanego przez TIM14.
+- Jesli w closed-loop zabraknie ZC, sterownik wykonuje do `DRIVER_SIXSTEP_BEMF_MISSING_ZC_VIRTUAL_STEPS` komutacji wirtualnych na ostatnim dobrym interwale.
+- Po przekroczeniu limitu brakow ZC sterownik przechodzi do `MOTOR_SIXSTEP_PHASE_RECOVERY_OFF` na `DRIVER_SIXSTEP_BEMF_RECOVERY_OFF_TICKS`, a potem probuje ponownie zlapac BEMF.
+
+## Twarde zabezpieczenie pradowe po IIR ADC
+
+- Wejscie pradu to `PA4 / ADC1_IN4`, zgodnie z fizycznym pinem 10 ukladu.
+- ADC1 pracuje w trybie ciaglym z DMA. `BOARD_ServiceCurrentAdc()` aktualizuje filtr IIR zdefiniowany przez `DRIVER_CURRENT_ADC_IIR_SHIFT`.
+- Aktualna PCB ma zaklocony surowy tor pomiaru pradu, dlatego twardy fault nie uzywa juz `ADC1 AWD1` na raw ADC.
+- Decyzja hard fault jest wykonywana w petli 10 kHz po aktualizacji `measured_current_ma`, czyli na wartosci po filtrze IIR.
+- Prog fault ustawia `DRIVER_SIXSTEP_HARD_CURRENT_LIMIT_MA`. Wartosc `0` wylacza ten fault programowy.
+- Po przekroczeniu progu wywolywane jest `MOTOR_EnterHardCurrentFault()`: kasuje oczekujaca komutacje, maskuje BEMF, zatrzymuje timer komutacji TIM14, zeruje PWM i wykonuje `BOARD_AllPhasesOff()`.
+- Fault jest zatrzaskiwany. Petla 10 kHz podtrzymuje stan OFF i czerwony status LED.
+- `g_motor.hard_current_adc_threshold` trzyma przeliczony prog ADC dla diagnostyki, a `g_motor.current_adc_raw`, `g_motor.current_adc_filtered` i `g_motor.measured_current_ma` pokazuja tor pomiaru.
+- Miekki ogranicznik `DRIVER_SIXSTEP_CURRENT_LIMIT_MA` nadal jest osobnym regulatorem PWM w 6-step C-L. Nie zastapuje twardego faultu po IIR.
+
+## Etap 12 - probkowanie BEMF w oknie PWM
+
+- Detekcja BEMF ma dwa rozdzielone okna:
+  - okno komutacji ZC, czyli kiedy w sektorze wolno uznac ZC,
+  - okno probkowania PWM, czyli kiedy poziom komparatora jest czytany bez szpilek od mostka.
+- Okno PWM nie lapie zbocza EXTI. Okno PWM probkuje poziom komparatora.
+- Stan bazowy `g_motor.bemf_pwm_last_level` jest ustawiany z teorii aktualnego kroku, a nie z odczytu komparatora.
+- Pierwsza czysta probka PWM moze od razu wykryc, ze poziom komparatora jest juz po ZC.
+- ZC z probkowania PWM jest uznane tylko wtedy, gdy:
+  - probka rozni sie od `g_motor.bemf_pwm_last_level`,
+  - probka jest zgodna z teoretycznym poziomem po ZC,
+  - minelo wiecej niz `bemf_average_interval_ticks / 2`.
+- Jezeli probka jest po ZC, ale czas jest zbyt krotki, stan bazowy nie jest zmieniany. Nastepna probka moze nadal zaliczyc ten sam ZC.
+- Tryb wyboru okna PWM ustawia `DRIVER_BEMF_PWM_GATING_MODE`: `NONE`, `OFF_TIME`, `ON_TIME` albo `AUTO`.
+- W trybie AUTO dziala histereza `DRIVER_BEMF_PWM_SAMPLE_ON_ENTER_PERMILLE` / `DRIVER_BEMF_PWM_SAMPLE_ON_EXIT_PERMILLE`.
+- Marginesy okna PWM ustawiaja `DRIVER_BEMF_PWM_SAMPLE_EDGE_SETTLE_TICKS` i `DRIVER_BEMF_PWM_SAMPLE_CLOSE_MARGIN_TICKS`.
+- Szczegolowy opis mechanizmu jest w `docs/am32_bemf_notes.md`.
 
 ## NVM
 
@@ -115,16 +135,8 @@ Wszystkie parametry trzymane sa w jednej globalnej strukturze. Kopia tej struktu
 
 Dodana zmienna:
 
-- `bemf_action_angle_offset_deg_x10` - wyprzedzenie katowe pomiedzy wykrytym zero-cross BEMF a wykonaniem kroku, w dziesiatych czesciach stopnia elektrycznego. Na etapie testowym default wraca do `0`, bo wymuszone 15 stopni powodowalo natychmiastowa utrate synchronizacji.
+- `bemf_action_angle_offset_deg_x10` - wyprzedzenie katowe pomiedzy wykrytym zero-cross BEMF a wykonaniem kroku, w dziesiatych czesciach stopnia elektrycznego.
 
-## Diagnostyka LED
+## LED
 
-PB8 / WS2812B pokazuje aktualny stan regulatora:
-
-- niebieski - `MOTOR_MODE_SINUS`,
-- zolty - `MOTOR_MODE_SIXSTEP` bez potwierdzonego BEMF,
-- zielony - `MOTOR_MODE_SIXSTEP` z `BEMF OK`,
-- czerwony - `MOTOR_MODE_STOP` lub stan bez aktywnej pracy,
-- bialy blysk - krotki znacznik aktywnego `BEMF OK`.
-
-LED nie jest elementem regulacji. Aktualizacja odbywa sie z petli glownej, a stan jest wyliczany na podstawie `g_motor.mode` oraz `g_motor.bemf_readable`.
+PB8 / WS2812B jest uzywana jako status poza szybkim torem komutacji: zielony oznacza SINUS albo 6-step C-L, czerwony oznacza twardy fault pradowy. W przerwaniach BEMF/TIM14 nie ma diagnostycznego migania fazami.

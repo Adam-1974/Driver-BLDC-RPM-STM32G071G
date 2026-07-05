@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | PA2 | BEMF_C | COMP2_INM, analog |
 | PA3 | BEMF_Vgnd | COMP2_INP, analog |
-| PA5 | current feedback | ADC1_IN5 |
+| PA4 / pin 10 | current feedback | ADC1_IN4 |
 | PA7 | LC | TIM1_CH1N PWM |
 | PA8 | HC | TIM1_CH1 PWM |
 | PA9 | HB | TIM1_CH2 PWM przez pad PA11 po `PA11_RMP` |
@@ -16,7 +16,7 @@
 | PD1 / pin 23 | BEMF_B | wejscie BEMF wg schematu; tor COMP do weryfikacji |
 | PB3 | BEMF_B_AM32 | wejscie COMP2_INM uzywane przez kod AM32 dla fazy B |
 | PB7 | BEMF_A | COMP2_INM, analog |
-| PB8 | LED WS2812B-2020 | GPIO output, pozniej TIM/DMA |
+| PB8 | LED WS2812B-2020 | status pracy, sterowana poza szybkim torem BEMF |
 
 ## Timery
 
@@ -51,16 +51,14 @@ Wniosek: BEMF_B w mapie projektu jest fizycznym pinem 23 / PD1. To nie jest ten 
 
 ## ADC
 
-PA5 jest skonfigurowane jako wejscie pomiaru pradu. Przeliczanie ADC -> mA jest parametrem NVM `adc_current_ma_per_count_q16`.
+PA4 / fizyczny pin 10 jest skonfigurowany jako wejscie pomiaru pradu `ADC1_IN4`.
 
-## LED statusu
+ADC1 pracuje w trybie ciaglym z DMA do jednego bufora. Czas probkowania ustawiono na `ADC_SAMPLETIME_19CYCLES_5`. Petla 10 kHz odczytuje probke DMA, filtruje ja IIR i uzywa tej wartosci do regulatorow pradu, diagnostyki oraz twardego faultu pradowego.
 
-PB8 steruje jedna dioda WS2812B-2020. W aktualnym etapie dioda jest obslugiwana programowo z petli glownej i sluzy tylko do diagnostyki:
+Na obecnej PCB surowy tor current feedback lapie zaklocenia od komutacji. Z tego powodu `ADC1 AWD1` nie jest uzywany jako zrodlo faultu. Zabezpieczenie porownuje `measured_current_ma` po IIR z `DRIVER_SIXSTEP_HARD_CURRENT_LIMIT_MA` i dopiero wtedy odcina mostek.
 
-- niebieski - praca w trybie SINUS,
-- zolty - praca w trybie 6-step bez potwierdzonego BEMF,
-- zielony - praca w trybie 6-step z potwierdzonym BEMF,
-- czerwony - STOP lub stan inny niz aktywna praca,
-- krotki bialy blysk - `BEMF OK`, czyli flaga `bemf_readable` jest ustawiona.
+Dla diagnostyki firmware zapisuje prog w `g_motor.hard_current_adc_threshold`, surowa probke w `g_motor.current_adc_raw`, wartosc po IIR w `g_motor.current_adc_filtered`, przeliczony prad w `g_motor.measured_current_ma`, a stan fault w `g_motor.hard_current_fault` i `g_motor.hard_current_fault_count`.
 
-Ramka WS2812 ma 24 bity i na czas jej wysylania przerwania sa maskowane bardzo krotko. To jest rozwiazanie diagnostyczne; jezeli LED bedzie potrzebna przy wysokich obrotach albo z czestymi zmianami, nalezy przeniesc sterowanie WS2812 na timer/DMA.
+## LED
+
+PB8 ma podlaczona diode WS2812B-2020. Aktualny firmware uzywa jej jako statusu pracy: zielony oznacza prace w SINUS albo 6-step C-L, czerwony oznacza twardy fault pradowy. W szybkich przerwaniach komutacji ustawiany jest tylko stan logiczny/fault; wysylanie koloru nie jest czescia toru BEMF/TIM14.
